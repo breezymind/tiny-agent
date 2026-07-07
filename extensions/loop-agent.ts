@@ -228,7 +228,65 @@ type GateState = {
   // 워크플로에 고유 ID를 부여한다. processingWorkflowId는 중복 agent_end 진입을 막는다.
   workflowId: string | null;
   processingWorkflowId: string | null;
+  // 출력 토큰 한도(stopReason="length")로 잘린 턴을 자동으로 이어서 진행한
+  // 횟수. pi 코어는 length 정지 시 tool call이 없으면 continue 없이 루프를
+  // 끝내므로(auto-compaction 여부와 무관), 확장이 후속 입력을 큐잉해 재개한다.
+  // 무한 재개를 막기 위해 상한을 두며, length가 아닌 정상 종료를 보면 0으로 되돌린다.
+  lengthContinueCount: number;
 };
+
+// length 정지 자동 재개 상한. 모델이 계속 한도에 부딪혀도 이 횟수를 넘으면
+// 재개를 멈추고 사용자에게 알린다.
+const MAX_LENGTH_CONTINUES = 10;
+// 잘린 응답을 이어가라고 지시하는 후속 사용자 메시지. 사용자가 수동으로 치던
+// "진행해"를 확장이 대신 보낸다.
+const LENGTH_CONTINUE_PROMPT =
+  "직전 응답이 출력 토큰 한도(stopReason=length)로 중간에 잘렸습니다. 새로 시작하지 말고 중단된 지점에서 이어서 계속 진행하세요.";
+// run이 idle로 전이할 때까지 자동 재개 대기 상한.
+const LENGTH_CONTINUE_TIMEOUT_MS = 60 * 1000;
+const LENGTH_CONTINUE_POLL_MS = 150;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 동일 시점에 두 개의 자동 재개가 예약되지 않도록 막는 전이 플래그(비영속).
+let lengthContinuePending = false;
+
+/**
+ * 출력 토큰 한도로 잘린 턴을 자동으로 이어서 진행한다.
+ *
+ * 반드시 분리(비-await) 실행해야 한다: agent_end 리스너가 모두 끝나야 run이
+ * idle로 전이하므로, 이 대기를 agent_end 안에서 await하면 교착이 발생한다.
+ * 그래서 호출측은 이 함수를 await하지 않고 호출만 하고 즉시 리턴한다.
+ */
+function scheduleLengthContinue(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): void {
+  if (lengthContinuePending) return;
+  lengthContinuePending = true;
+  void (async () => {
+    try {
+      const deadline = Date.now() + LENGTH_CONTINUE_TIMEOUT_MS;
+      // 컴팩션 등 후속 스트리밍까지 끝나 실제로 idle이 될 때까지 기다린다.
+      while (!ctx.isIdle() && Date.now() < deadline) {
+        await sleep(LENGTH_CONTINUE_POLL_MS);
+      }
+      if (!ctx.isIdle()) {
+        ctx.ui.notify(
+          "loop-agent: 자동 이어가기 대기 시간이 초과되어 중단합니다. 필요하면 직접 이어서 진행하세요.",
+          "warning",
+        );
+        return;
+      }
+      // idle 상태에서 보내는 사용자 메시지는 항상 새 턴을 트리거한다.
+      pi.sendUserMessage(LENGTH_CONTINUE_PROMPT);
+    } finally {
+      lengthContinuePending = false;
+    }
+  })();
+}
 
 type PersistedWorkflowState = Pick<
   GateState,
@@ -244,6 +302,7 @@ const state: GateState = {
   autoMode: false,
   workflowId: null,
   processingWorkflowId: null,
+  lengthContinueCount: 0,
 };
 
 const DEFAULT_CONFIG: WorkflowConfig = {
@@ -538,6 +597,19 @@ function getLastAssistantText(event: AgentEndEvent): string {
   }
 
   return "";
+}
+
+/** agent_end 이벤트에서 마지막 어시스턴트 메시지의 stopReason을 꺼낸다. */
+function getLastAssistantStopReason(event: AgentEndEvent): string | null {
+  for (let index = event.messages.length - 1; index >= 0; index -= 1) {
+    const message = event.messages[index] as {
+      role?: string;
+      stopReason?: string;
+    };
+    if (message.role !== "assistant") continue;
+    return message.stopReason ?? null;
+  }
+  return null;
 }
 
 /** grill-checklist가 약속한 주석 경계 사이의 체크리스트를 원문 그대로 꺼낸다. */
@@ -1220,6 +1292,34 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (event, ctx) => {
+    // 출력 토큰 한도로 잘린 턴(stopReason="length")은 pi 코어가 자동으로
+    // 이어가지 않는다(tool call이 없는 정상 종료로 취급되어 루프가 끝난다).
+    // 사용자가 수동으로 "진행해"를 치던 것을 대신해, run이 idle이 되면 후속
+    // 입력을 보내 중단 지점에서 이어가게 한다. 자동 계획/구현뿐 아니라 일반
+    // 대화 턴에서도 동일하게 동작하도록 다른 분기보다 먼저 처리한다.
+    const stopReason = getLastAssistantStopReason(event);
+    if (stopReason === "length") {
+      if (state.lengthContinueCount >= MAX_LENGTH_CONTINUES) {
+        // 카운터를 리셋하지 않는다. 리셋하면 다음 length 정지에서 곧바로 새
+        // 재개 사이클이 시작돼 상한이 사실상 무력화된다. 정상 종료(아래 분기)를
+        // 볼 때에만 0으로 되돌려, 실제 진전이 있을 때만 재개를 다시 허용한다.
+        ctx.ui.notify(
+          `loop-agent: 출력 한도로 인한 자동 이어가기가 상한(${MAX_LENGTH_CONTINUES}회)에 도달해 멈춥니다. 필요하면 직접 이어서 진행하세요.`,
+          "warning",
+        );
+        return;
+      }
+      state.lengthContinueCount += 1;
+      ctx.ui.notify(
+        `loop-agent: 응답이 출력 한도로 잘려 중단 지점에서 자동으로 이어갑니다 (${state.lengthContinueCount}/${MAX_LENGTH_CONTINUES}).`,
+        "info",
+      );
+      scheduleLengthContinue(pi, ctx);
+      return;
+    }
+    // 정상적으로 끝난 턴을 보면 재개 카운터를 초기화한다.
+    state.lengthContinueCount = 0;
+
     const planningResponse = getLastAssistantText(event);
     const latestChecklist = extractChecklist(planningResponse);
 
