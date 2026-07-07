@@ -1,0 +1,22 @@
+{
+  "lastChangelogVersion": "0.80.3",
+  "theme": "dark",
+  "defaultProvider": "litellm",
+  "defaultModel": "claude-opus-4-8",
+  "defaultThinkingLevel": "xhigh",
+  "loopAgent": {
+    "planningModel": "litellm/claude-opus-4-8",
+    "planningThinkingLevel": "medium",
+    "codingModel": "litellm/claude-sonnet-5",
+    "codingThinkingLevel": "medium",
+    "verifyingModel": "litellm/claude-opus-4-8",
+    "verifyingThinkingLevel": "medium",
+    "testModel": "litellm/claude-sonnet-5",
+    "testThinkingLevel": "medium",
+    "maxImprovementRounds": 3
+  },
+  "packages": [
+    "npm:pi-mcp-adapter",
+    "npm:pi-provider-litellm"
+  ]
+}
