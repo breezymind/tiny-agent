@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "codegraph": {
+      "command": "/Users/breezymind/.nvm/versions/node/v24.9.0/bin/codegraph",
+      "args": [
+        "serve",
+        "--mcp"
+      ],
+      "directTools": true
+    }
+  }
+}

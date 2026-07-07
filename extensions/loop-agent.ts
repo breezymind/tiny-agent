@@ -5,6 +5,7 @@ import type {
   SessionCompactEvent,
   SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -248,6 +249,231 @@ const LENGTH_CONTINUE_POLL_MS = 150;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shortenStatusLine(text: string, maxLength = 120): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= maxLength) return collapsed;
+  return `${collapsed.slice(0, maxLength - 1)}…`;
+}
+
+type StreamingRunResult = {
+  code: number;
+  stdout: string;
+  stderr: string;
+};
+
+function formatProgressMessage(
+  label: string,
+  stream: "stdout" | "stderr" | "heartbeat",
+  transcript: string[],
+  details?: string,
+): string {
+  const lines = [
+    `## ${label} 진행 로그`,
+    "",
+    `- 최신 상태: ${stream}`,
+    `- 누적 로그: ${transcript.length}줄`,
+  ];
+
+  if (details) {
+    lines.push(`- 상세: ${details}`);
+  }
+
+  lines.push("", transcript.slice(-20).join("\n") || "(아직 출력 없음)");
+  return lines.join("\n");
+}
+
+async function runPiCommandWithProgress(
+  pi: Pick<ExtensionAPI, "sendMessage">,
+  cwd: string,
+  ui: Pick<ExtensionContext["ui"], "setStatus">,
+  label: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<StreamingRunResult> {
+  ui.setStatus("loop-agent", `${label} 시작`);
+
+  return await new Promise<StreamingRunResult>((resolve, reject) => {
+    const child = spawn("pi", args, {
+      cwd,
+      env: {
+        ...process.env,
+        LOOP_AGENT_CHILD: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    const progressTranscript: string[] = [];
+    let stdoutRemainder = "";
+    let stderrRemainder = "";
+    let lastActivity = Date.now();
+    let finished = false;
+    let timedOut = false;
+
+    const clearStatus = (): void => {
+      ui.setStatus("loop-agent", undefined);
+    };
+
+    const finish = (result: StreamingRunResult): void => {
+      if (finished) return;
+      finished = true;
+      clearInterval(heartbeat);
+      clearTimeout(timer);
+      clearStatus();
+      resolve(result);
+    };
+
+    const fail = (error: Error): void => {
+      if (finished) return;
+      finished = true;
+      clearInterval(heartbeat);
+      clearTimeout(timer);
+      clearStatus();
+      reject(error);
+    };
+
+    const updateStatus = (phase: string, chunk: string): void => {
+      const line = chunk.split(/\r?\n/).filter(Boolean).at(-1);
+      if (!line) return;
+      ui.setStatus(
+        "loop-agent",
+        `${label} ${phase}: ${shortenStatusLine(line)}`,
+      );
+    };
+
+    const ingestStream = (
+      stream: "stdout" | "stderr",
+      chunk: string,
+    ): void => {
+      lastActivity = Date.now();
+      const isStdout = stream === "stdout";
+      const current = (isStdout ? stdoutRemainder : stderrRemainder) + chunk;
+      const parts = current.split(/\r?\n/);
+      const remainder = parts.pop() ?? "";
+      if (isStdout) stdoutRemainder = remainder;
+      else stderrRemainder = remainder;
+
+      const lines = parts.map((line) => line.trim()).filter(Boolean);
+      if (lines.length === 0) return;
+
+      for (const line of lines) {
+        progressTranscript.push(`[${stream}] ${line}`);
+      }
+
+      pi.sendMessage(
+        {
+          customType: "loop-agent-progress",
+          content: formatProgressMessage(label, stream, progressTranscript),
+          display: true,
+          details: {
+            label,
+            stream,
+            lines: progressTranscript.length,
+          },
+        },
+        { triggerTurn: false },
+      );
+    };
+
+    const heartbeat = setInterval(() => {
+      if (finished) return;
+      const elapsedSeconds = Math.max(
+        1,
+        Math.floor((Date.now() - lastActivity) / 1000),
+      );
+      pi.sendMessage(
+        {
+          customType: "loop-agent-progress",
+          content: formatProgressMessage(
+            label,
+            "heartbeat",
+            progressTranscript,
+            `${elapsedSeconds}초 동안 새 출력 없음`,
+          ),
+          display: true,
+          details: {
+            label,
+            stream: "heartbeat",
+            lines: progressTranscript.length,
+            elapsedSeconds,
+          },
+        },
+        { triggerTurn: false },
+      );
+    }, 5000);
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+      ui.setStatus("loop-agent", `${label} 시간 초과, 종료 중`);
+    }, timeoutMs);
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf8");
+      stdout += text;
+      updateStatus("진행", text);
+      ingestStream("stdout", text);
+    });
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      const text = chunk.toString("utf8");
+      stderr += text;
+      updateStatus("오류 출력", text);
+      ingestStream("stderr", text);
+    });
+
+    child.once("error", (error) => {
+      fail(error instanceof Error ? error : new Error(String(error)));
+    });
+
+    child.once("close", (code, signal) => {
+      clearInterval(heartbeat);
+      if (timedOut) {
+        fail(
+          new Error(
+            `${label} 실행이 ${Math.floor(timeoutMs / 1000)}초 제한을 넘겨 종료되었습니다.`,
+          ),
+        );
+        return;
+      }
+
+      const flushRemainder = (
+        stream: "stdout" | "stderr",
+        remainder: string,
+      ): void => {
+        const text = remainder.trim();
+        if (!text) return;
+        lastActivity = Date.now();
+        progressTranscript.push(`[${stream}] ${text}`);
+        pi.sendMessage(
+          {
+            customType: "loop-agent-progress",
+            content: formatProgressMessage(label, stream, progressTranscript),
+            display: true,
+            details: {
+              label,
+              stream,
+              lines: progressTranscript.length,
+            },
+          },
+          { triggerTurn: false },
+        );
+      };
+
+      flushRemainder("stdout", stdoutRemainder);
+      flushRemainder("stderr", stderrRemainder);
+
+      finish({
+        code: code ?? (signal ? 1 : 0),
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+      });
+    });
+  });
 }
 
 // 동일 시점에 두 개의 자동 재개가 예약되지 않도록 막는 전이 플래그(비영속).
@@ -705,7 +931,14 @@ async function runIndependentReview(
   if (thinkingLevel) args.push("--thinking", thinkingLevel);
   args.push(prompt);
 
-  const result = await pi.exec("pi", args, { cwd, timeout: REVIEW_TIMEOUT_MS });
+  const result = await runPiCommandWithProgress(
+    pi,
+    cwd,
+    pi.ui,
+    "독립 검수 에이전트",
+    args,
+    REVIEW_TIMEOUT_MS,
+  );
 
   if (result.code !== 0) {
     const reason = result.stderr.trim() || `exit code ${result.code}`;
@@ -781,11 +1014,15 @@ async function runCodingAgent(
   args.push(prompt);
 
   // loop-agent만 환경 플래그로 비활성화하고 MCP 어댑터 등 나머지 확장은
-  // 그대로 로드한다. --tools allowlist도 쓰지 않아 확장 도구를 제한하지 않는다.
-  const result = await pi.exec("env", ["LOOP_AGENT_CHILD=1", "pi", ...args], {
-    cwd: ctx.cwd,
-    timeout: CODING_TIMEOUT_MS,
-  });
+  // 그대로 로드한다. 직접 spawn해서 stdout/stderr를 중간중간 status로 흘린다.
+  const result = await runPiCommandWithProgress(
+    pi,
+    ctx.cwd,
+    ctx.ui,
+    "코드 에이전트",
+    args,
+    CODING_TIMEOUT_MS,
+  );
   if (result.code !== 0) {
     const reason = result.stderr.trim() || `exit code ${result.code}`;
     throw new Error(`코드 에이전트 실행 실패: ${reason}`);
@@ -836,10 +1073,14 @@ async function runTestAgent(
 
   // 검수와 같은 이유로 --no-extensions를 쓰지 않는다: bash 도구를 테스트 스위트에서만 쓰는
   // 것은 테스트 에이전트의 책임이고, LOOP_AGENT_CHILD 가드가 이 확장의 재가동을 구조적으로 막는다.
-  const result = await pi.exec("env", ["LOOP_AGENT_CHILD=1", "pi", ...args], {
-    cwd: ctx.cwd,
-    timeout: TEST_TIMEOUT_MS,
-  });
+  const result = await runPiCommandWithProgress(
+    pi,
+    ctx.cwd,
+    ctx.ui,
+    "테스트 에이전트",
+    args,
+    TEST_TIMEOUT_MS,
+  );
   if (result.code !== 0) {
     const reason = result.stderr.trim() || `exit code ${result.code}`;
     throw new Error(`테스트 에이전트 실행 실패: ${reason}`);
