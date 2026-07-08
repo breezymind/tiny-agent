@@ -1,22 +1,23 @@
 {
   "lastChangelogVersion": "0.80.3",
   "theme": "dark",
-  "defaultProvider": "litellm",
-  "defaultModel": "claude-opus-4-8",
+  "defaultProvider": "openai-codex",
+  "defaultModel": "gpt-5.4",
   "defaultThinkingLevel": "high",
   "loopAgent": {
-    "planningModel": "litellm/claude-opus-4-8",
+    "planningModel": "openai-codex/gpt-5.4",
     "planningThinkingLevel": "high",
-    "codingModel": "litellm/claude-sonnet-5",
-    "codingThinkingLevel": "medium",
-    "verifyingModel": "litellm/claude-opus-4-8",
+    "codingModel": "openai-codex/gpt-5.4-mini",
+    "codingThinkingLevel": "xhigh",
+    "verifyingModel": "openai-codex/gpt-5.4",
     "verifyingThinkingLevel": "high",
-    "testModel": "litellm/claude-sonnet-5",
-    "testThinkingLevel": "medium",
+    "testModel": "openai-codex/gpt-5.4-mini",
+    "testThinkingLevel": "xhigh",
     "maxImprovementRounds": 3
   },
   "packages": [
     "npm:pi-mcp-adapter",
-    "npm:pi-provider-litellm"
+    "npm:pi-provider-litellm",
+    "npm:@capyup/pi-basic-tools"
   ]
 }

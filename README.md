@@ -141,10 +141,12 @@ Pi가 저장소를 받아 `extensions/`, `skills/` 디렉토리를 자동 발견
 
 ```bash
 pi install git:github.com/breezymind/tiny-agent
+pi install npm:@capyup/pi-basic-tools
 ```
 
 - 전역이 아닌 특정 프로젝트에만 설치하려면 `-l`(`--local`)을 붙입니다.
 - 설치·제거·목록은 `pi list`, `pi remove <source>`, `pi update`로 관리합니다.
+- `npm:@capyup/pi-basic-tools`는 기본 편집·운영 보조 도구 묶음입니다.
 
 > **참고:** `pi install`은 확장·스킬 **리소스만** 등록합니다.
 > `AGENT.md`(전역 규칙), `settings.json`의 `loopAgent` 모델 구성, `mcp.json` 같은
@@ -184,6 +186,11 @@ cd ~/.pi/agent/npm && npm install   # 확장 실행에 필요한 npm 의존성
     }
   }
   ```
+
+### 편집 규칙
+
+파일을 수정할 때는 `bash`로 직접 덮어쓰지 말고 `apply_patch`를 기본 도구로 사용합니다.
+`bash`는 탐색, 검증, 빌드, 포맷팅 같은 실행 용도로만 씁니다.
 
 ### 실행
 

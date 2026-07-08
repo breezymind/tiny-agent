@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "codegraph": {
-      "command": "/Users/karl/.nvm/versions/node/v24.11.0/bin/codegraph",
+      "command": "/Users/breezymind/.nvm/versions/node/v24.9.0/bin/codegraph",
       "args": [
         "serve",
         "--mcp"
