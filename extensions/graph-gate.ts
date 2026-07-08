@@ -5,8 +5,8 @@ import { findGitRoot, isGraphAvailable, readMcpConfig, type McpConfig } from "./
 // 그래프 우선(graph-first) 게이트:
 // 에이전트가 grep/read 같은 원시 소스 검색·읽기를 하기 전에
 // CodeGraph 도구를 먼저 시도하도록 강제한다.
-// - permissive(기본): 턴마다 첫 위반만 차단하고, 이후 fallback 검색은 허용한다.
-// - strict: graph discovery를 시도하기 전까지 계속 차단한다.
+// - strict(인덱스가 있으면 기본): graph discovery를 시도하기 전까지 계속 차단한다.
+// - permissive: 턴마다 첫 위반만 차단하고, 이후 fallback 검색은 허용한다.
 // /graph-gate 명령으로 세션 중에 모드를 바꾸거나 상태를 확인할 수 있다.
 //
 // 게이트는 실제로 그래프 도구를 쓸 수 있을 때만 적용된다: codegraph가
@@ -87,6 +87,27 @@ const GRAPH_STATUS_TOOLS = [
   "codegraph_status",
 ] as const;
 
+const DOCUMENT_READ_PREFIXES = [
+  "docs/",
+  "skills/",
+  "templates/",
+  ".claude/",
+] as const;
+
+const DOCUMENT_READ_NAMES = new Set([
+  "AGENT.md",
+  "CONTEXT.md",
+  "README.md",
+  "package.json",
+  "tsconfig.json",
+  "settings.json",
+  "settings.local.json",
+  ".mcp.json",
+  "skills-lock.json",
+  "auth.json",
+  "trust.json",
+]);
+
 const SHELL_TOOL_NAMES = ["bash", "shell", "exec", "command", "rtk"] as const;
 const FILE_READ_TOOL_NAMES = ["read"] as const;
 
@@ -127,6 +148,29 @@ function isFileReadTool(toolName: string): boolean {
   return toolNameMatches(toolName, FILE_READ_TOOL_NAMES);
 }
 
+function normalizePathLike(path: string): string {
+  return path.replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/^\/+/, "");
+}
+
+function isAllowlistedDocumentPath(path: string): boolean {
+  const normalized = normalizePathLike(path);
+  if (!normalized) return false;
+
+  if (
+    DOCUMENT_READ_PREFIXES.some(
+      (prefix) =>
+        normalized === prefix.slice(0, -1) || normalized.startsWith(prefix),
+    )
+  ) {
+    return true;
+  }
+
+  const baseName = normalized.split("/").pop() ?? normalized;
+  if (DOCUMENT_READ_NAMES.has(baseName)) return true;
+
+  return false;
+}
+
 // tool input에서 실제 명령으로 쓸 수 있는 문자열 필드만 모은다.
 // path/query 같은 값은 오탐을 늘리기 쉬워서 여기서는 제외한다.
 function collectTextFragments(input: Record<string, unknown>): string[] {
@@ -146,6 +190,25 @@ function collectTextFragments(input: Record<string, unknown>): string[] {
   }
 
   return fragments;
+}
+
+function extractReadTarget(input: Record<string, unknown>): string | undefined {
+  for (const key of [
+    "path",
+    "file_path",
+    "filePath",
+    "target",
+    "targetPath",
+    "file",
+    "filename",
+  ] as const) {
+    const value = input[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return undefined;
 }
 
 // read 계열 도구는 별도 명령 문자열이 없을 수 있으므로 이름만으로도 판정할 수 있게 한다.
@@ -411,6 +474,7 @@ export default function graphFirstGate(pi: ExtensionAPI) {
 
     state.projectRoot = ctx.isProjectTrusted() ? await findGitRoot(pi, ctx.cwd) : undefined;
     state.sessionGraphAvailable = await isGraphAvailable(pi, state.projectRoot, readMcpConfig());
+    state.strict = state.sessionGraphAvailable;
 
     const scopeHint = state.sessionGraphAvailable
       ? "graph index found"
@@ -453,6 +517,13 @@ export default function graphFirstGate(pi: ExtensionAPI) {
         "info",
       );
       return;
+    }
+
+    if (isFileReadTool(toolName)) {
+      const readTarget = extractReadTarget((event.input ?? {}) as Record<string, unknown>);
+      if (readTarget && isAllowlistedDocumentPath(readTarget)) {
+        return;
+      }
     }
 
     const command = extractCommand(event);

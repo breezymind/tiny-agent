@@ -159,33 +159,209 @@ function buildTaskTrackingInstructions(root: string): string {
   ].join("\n");
 }
 
+function buildQuickChecklist(objective: string): string {
+  const summary = shortenStatusLine(objective, 120);
+  return [
+    "## 목표 결과 체크리스트",
+    `- [ ] 요청 "${summary}" 를 최소 변경으로 구현했다.`,
+    "- [ ] 관련 검증(테스트, 빌드, 정적 검사) 중 필요한 것을 실행했다.",
+    "- [ ] 기존의 직접 연관된 동작을 불필요하게 바꾸지 않았다.",
+  ].join("\n");
+}
+
+function buildDirectCodingPrompt(objective: string, root: string): {
+  checklist: string;
+  prompt: string;
+} {
+  const checklist = buildQuickChecklist(objective);
+  const prompt = [
+    "작은 단일 작업이다. 인터뷰, PRD, 이슈 분해 없이 바로 구현하라.",
+    "최소 변경으로 요청을 충족하고, 끝나면 변경 내용과 검증 근거를 간단히 보고하라.",
+    "",
+    "다음 체크리스트를 만족하도록 작업하라:",
+    checklist,
+    "",
+    buildImplementSkillGuidance(),
+    "",
+    buildTaskTrackingInstructions(root),
+    "",
+    "작업 요청:",
+    objective,
+  ].join("\n");
+
+  return { checklist, prompt };
+}
+
+function isLikelyQuickTask(objective: string): boolean {
+  const normalized = objective.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) return false;
+  if (normalized.length > 120) return false;
+  if (/\n|;|&&|\|\|/.test(normalized)) return false;
+
+  const actionMarkers = [
+    "fix",
+    "remove",
+    "rename",
+    "update",
+    "add",
+    "change",
+    "adjust",
+    "reduce",
+    "simplify",
+    "shorten",
+    "cleanup",
+    "patch",
+    "replace",
+    "restore",
+    "allow",
+    "block",
+    "sort",
+    "normalize",
+    "trim",
+    "repair",
+    "enable",
+    "disable",
+    "강화",
+    "완화",
+    "수정",
+    "추가",
+    "삭제",
+    "변경",
+    "정리",
+    "줄여",
+    "줄이",
+    "짧게",
+    "정규화",
+    "복구",
+    "차단",
+    "허용",
+    "개선",
+    "패치",
+    "교체",
+    "조정",
+    "해결",
+    "고쳐",
+    "고치",
+    "바꿔",
+    "바꾸",
+    "아껴",
+    "아끼",
+    "만들",
+    "수리",
+  ];
+  if (!actionMarkers.some((marker) => normalized.includes(marker))) {
+    return false;
+  }
+
+  const complexityMarkers = [
+    "plan",
+    "prd",
+    "design",
+    "architecture",
+    "analysis",
+    "review",
+    "test",
+    "migration",
+    "refactor",
+    "document",
+    "spec",
+    "prototype",
+    "investigate",
+    "analyze",
+    "multiple",
+    "all of",
+    "여러",
+    "복수",
+    "전체",
+    "모두",
+    "계획",
+    "설계",
+    "분석",
+    "검토",
+    "테스트",
+    "마이그레이션",
+    "리팩터",
+    "문서",
+    "사양",
+    "아키텍처",
+  ];
+  if (complexityMarkers.some((marker) => normalized.includes(marker))) {
+    return false;
+  }
+
+  const words = normalized.split(/\s+/).length;
+  return words <= 12;
+}
+
+function parseGoalMode(
+  objective: string,
+): { mode: "plan" | "direct"; objective: string } | null {
+  const match = objective.trim().match(/^(plan|direct)\s+(.+)$/i);
+  if (!match) return null;
+  return {
+    mode: match[1].toLowerCase() as "plan" | "direct",
+    objective: match[2].trim(),
+  };
+}
+
+function ensureWorkflowWorkspace(
+  ctx: ExtensionContext,
+  explicit: boolean,
+): boolean {
+  if (!ctx.isIdle()) {
+    ctx.ui.notify(
+      "loop-agent: 현재 에이전트 실행이 끝난 뒤 다시 시도하세요.",
+      "warning",
+    );
+    return false;
+  }
+  if (state.workflowId || state.processingWorkflowId) {
+    ctx.ui.notify(
+      "loop-agent: 이미 진행 중인 목표가 있습니다. 중단하려면 /loop-agent clear를 먼저 실행하세요.",
+      "warning",
+    );
+    return false;
+  }
+
+  try {
+    const created = ensureProjectDocs(ctx.cwd);
+    if (created.length > 0) {
+      ctx.ui.notify(
+        `loop-agent: 이 프로젝트에 이슈 트래커 문서를 생성했습니다 (${created.length}개): ${created.join(", ")}`,
+        "info",
+      );
+    }
+  } catch (error) {
+    if (explicit) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(
+        `loop-agent: 이슈 트래커 문서를 생성하지 못했습니다: ${message}`,
+        "error",
+      );
+    }
+    return false;
+  }
+
+  return true;
+}
+
 // 구현 단계에서 따를 스킬: implement(구현 절차) + tdd(red-green-refactor 규율).
-// 코딩 자식 프로세스는 --no-skills로 도다부로 /skill 확장이 안 먹으므로,
-// 계획 파이프라인처럼 스킬 본문을 <skill> 블록으로 직접 주입한다.
+// 자식 프로세스는 --no-skills로 실행되므로, 본문을 직접 붙이지 말고 파일 경로만
+// 알려준 뒤 read 도구로 읽게 한다.
 const IMPLEMENT_PIPELINE_SKILLS = ["implement", "tdd"] as const;
 
-// implement/tdd 스킬 본문을 그대로 넣되, 이 파이프라인과 충돌하는 지시(/tdd·
-// /code-review 슬래시 호출, 자체 커밋)를 어댑터 문구로 덮어쓴다. code-review는
-// 확장이 독립 검수(runValidatedReview)로 수행하므로 자식이 중복 수행하지 않게 한다.
 function buildImplementSkillGuidance(): string {
-  const skillBlocks = IMPLEMENT_PIPELINE_SKILLS.map((skillName) =>
-    buildSkillBlock(skillName, skillPath(skillName)),
-  ).join("\n\n");
+  const skillFiles = IMPLEMENT_PIPELINE_SKILLS.map((skillName) =>
+    skillPath(skillName),
+  );
 
   return [
-    skillBlocks,
-    "",
     "<implement-adapter>",
-    "위 implement·tdd 스킬의 구현 절차와 테스트 규율(red-green-refactor, vertical slice,",
-    "내부 mocking 금지, 공개 인터페이스 기준 테스트)을 그대로 따르되, 이 자동 파이프라인에",
-    "맞게 아래를 적용한다:",
-    "- 스킬 본문의 `/tdd`, `/code-review` 같은 슬래시 호출은 무시하라. 이 프로세스는 --no-skills라",
-    "  슬래시 확장이 동작하지 않는다. tdd 규율은 위 tdd 스킬 본문을 그대로 적용하면 된다.",
-    "- 코드 검수(code-review)는 네가 하지 마라. 별도 독립 검수 에이전트가 이후에 체크리스트를 검증한다.",
-    "- 직접 git 커밋/푸시하지 마라. 변경만 남기고 보고하면 확장이 검수·후속을 처리한다.",
-    "- 스킬이 언급하는 gsd_*, .gsd/*, S##/T## 등 GSD 전용 도구·경로는 이 프로젝트에 없으니",
-    "  무시하고, 태스크 상태는 위 <task-tracking> 지침(docs/tasks/*)으로만 관리하라.",
-    "- 테스트 실행 자체는 해도 되지만, 최종 판정은 별도 테스트·검수 에이전트가 다시 확인한다.",
+    "아래 스킬 파일을 먼저 직접 읽고 절차를 따르라. 본문을 프롬프트에 재인용하지 말라:",
+    ...skillFiles.map((filePath) => `- ${filePath}`),
+    "이 자동 파이프라인에서는 `/tdd`, `/code-review` 슬래시 호출을 스스로 하지 말라.",
+    "직접 git 커밋/푸시는 하지 말고, 태스크 상태는 위 <task-tracking> 지침만 따르라.",
+    "테스트 실행은 가능하지만, 최종 판정은 별도 테스트·검수 에이전트가 다시 확인한다.",
     "</implement-adapter>",
   ].join("\n");
 }
@@ -317,7 +493,7 @@ function formatProgressMessage(
     lines.push(`- 상세: ${details}`);
   }
 
-  lines.push("", transcript.slice(-40).join("\n") || "(아직 출력 없음)");
+  lines.push("", transcript.slice(-8).join("\n") || "(아직 출력 없음)");
   return lines.join("\n");
 }
 
@@ -369,8 +545,8 @@ function extractFinalTextFromMessages(
 /** 도구 인자 객체에서 표시에 쓸 대표 필드만 골라 한 줄로 축약한다. */
 function summarizeToolArgs(args: unknown): string {
   if (args == null) return "";
-  if (typeof args === "string") return shortenStatusLine(args, 80);
-  if (typeof args !== "object") return shortenStatusLine(String(args), 80);
+  if (typeof args === "string") return shortenStatusLine(args, 60);
+  if (typeof args !== "object") return shortenStatusLine(String(args), 60);
 
   const record = args as Record<string, unknown>;
   // 자주 쓰는 도구 인자의 핵심 필드를 우선 노출한다.
@@ -387,11 +563,11 @@ function summarizeToolArgs(args: unknown): string {
   for (const key of preferred) {
     const value = record[key];
     if (typeof value === "string" && value.trim()) {
-      return shortenStatusLine(value, 80);
+      return shortenStatusLine(value, 60);
     }
   }
   try {
-    return shortenStatusLine(JSON.stringify(args), 80);
+    return shortenStatusLine(JSON.stringify(args), 60);
   } catch {
     return "";
   }
@@ -400,7 +576,7 @@ function summarizeToolArgs(args: unknown): string {
 /** 도구 결과(AgentToolResult 또는 임의 값)에서 표시용 텍스트를 축약한다. */
 function summarizeToolResult(result: unknown): string {
   if (result == null) return "";
-  if (typeof result === "string") return shortenStatusLine(result, 80);
+  if (typeof result === "string") return shortenStatusLine(result, 60);
   if (typeof result === "object") {
     const record = result as Record<string, unknown>;
     const content = record.content;
@@ -413,15 +589,15 @@ function summarizeToolResult(result: unknown): string {
         )
         .map((part) => part.text as string)
         .join(" ");
-      if (text.trim()) return shortenStatusLine(text, 80);
+      if (text.trim()) return shortenStatusLine(text, 60);
     }
     try {
-      return shortenStatusLine(JSON.stringify(result), 80);
+      return shortenStatusLine(JSON.stringify(result), 60);
     } catch {
       return "";
     }
   }
-  return shortenStatusLine(String(result), 80);
+  return shortenStatusLine(String(result), 60);
 }
 
 type ParsedEventLine = {
@@ -496,7 +672,7 @@ function handleJsonEvent(
       if (ame.type === "text_delta" && typeof ame.delta === "string") {
         parse.assistantBuffer += ame.delta;
         // 델타는 상태줄로만 흘린다(토큰 단위라 로그로 남기면 폭발한다).
-        return { status: `💬 ${shortenStatusLine(parse.assistantBuffer, 80)}` };
+        return { status: `💬 ${shortenStatusLine(parse.assistantBuffer, 60)}` };
       }
       if (ame.type === "text_end" && typeof ame.content === "string") {
         parse.assistantBuffer = "";
@@ -981,6 +1157,8 @@ function resolveTestThinkingLevel(): ThinkingLevel | null {
  */
 function findMissingPipelinePrerequisite(root: string): string | null {
   const required = [
+    skillPath("grilling"),
+    skillPath("domain-modeling"),
     ...PLANNING_PIPELINE_SKILLS.map((skillName) => skillPath(skillName)),
     projectDocPaths(root).issueTracker,
   ];
@@ -994,63 +1172,32 @@ function findMissingPipelinePrerequisite(root: string): string | null {
   return null;
 }
 
-function buildSkillBlock(skillName: string, skillFilePath: string): string {
-  const source = fs.readFileSync(skillFilePath, "utf8");
-  const body = source.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "").trim();
-  return [
-    `<skill name="${skillName}" location="${skillFilePath}">`,
-    `References are relative to ${path.dirname(skillFilePath)}.`,
-    "",
-    body,
-    "</skill>",
-  ].join("\n");
-}
-
 /**
  * 자동 계획 턴에 필요한 스킬 지침을 모두 주입한다. 파이프라인은
  * grill-with-docs → to-prd → to-issues → grill-checklist 순서로 하나의 턴에서
  * 진행되며, 마지막에 grill-checklist가 기계 판독 경계 안에 목표 체크리스트를
- * 출력해야 한다. 스킬 파일이나 issue-tracker.md가 하나라도 없으면 파이프라인이
- * 성립하지 않으므로 readFileSync 실패를 그대로 상위(/goal 핸들러)로 전파한다.
+ * 출력해야 한다. 세부 절차는 각 스킬 파일과 issue-tracker 문서를 직접 읽어
+ * 따르도록 하고, 이 프롬프트에는 반복되는 본문을 재주입하지 않는다.
  */
 function buildPlanningPipelinePrompt(
   objective: string,
   workflowId: string,
   root: string,
 ): string {
-  const skillBlocks = PLANNING_PIPELINE_SKILLS.map((skillName) =>
-    buildSkillBlock(skillName, skillPath(skillName)),
-  ).join("\n\n");
-
-  // to-prd/to-issues는 "이슈 트래커가 제공되었다"는 전제로 동작하므로,
-  // 발행 규약(issue-tracker.md)을 반드시 프롬프트에 함께 주입한다. 문서가
-  // 없으면 발행 대상을 알 수 없으므로 명시적으로 실패시켜 /goal을 멈춘다.
-  const issueTrackerPath = projectDocPaths(root).issueTracker;
-  const issueTrackerDoc = fs.readFileSync(issueTrackerPath, "utf8").trim();
-  const issueTrackerBlock = [
-    `<issue-tracker location="${issueTrackerPath}">`,
-    "to-prd와 to-issues가 이슈를 발행·조회할 때 따라야 하는 유일한 규약이다.",
-    "외부 트래커 CLI나 MCP를 가정하지 말고 이 문서의 로컬 작업 목록 파일 규약만 사용하라.",
-    "",
-    issueTrackerDoc,
-    "</issue-tracker>",
-  ].join("\n");
-
+  const docs = projectDocPaths(root);
   return [
-    skillBlocks,
-    "",
-    issueTrackerBlock,
-    "",
     "<loop-agent-pipeline>",
-    "이 목표는 아래 스킬을 정확히 이 순서대로 수행하는 반자동 워크플로다.",
-    "1) grill-with-docs: 인터뷰는 반드시 한 번에 하나씩, 사람과 질문/답변을 주고받으며 진행해 의사결정 트리를 닫고, 진행 중 ADR·용어집을 생성한다.",
-    "   아직 물을 질문이 남았으면 그 턴은 질문으로 끝내고 사람의 답변을 기다린다. 답을 스스로 지어내거나 인터뷰를 건너뛰지 말라.",
-    "2) to-prd: 인터뷰가 완전히 끝난 뒤, 합의한 내용만으로 PRD를 작성해 docs/tasks/backlog.md에 발행한다. 추가 인터뷰는 하지 않는다.",
-    "3) to-issues: PRD를 tracer-bullet vertical slice 태스크로 쪼개 docs/tasks/backlog.md에 발행한다.",
-    "발행은 반드시 <issue-tracker> 문서가 지정한 docs/tasks/backlog.md에 append-only로 한다. 외부 트래커를 찾지 말라.",
-    "4) grill-checklist: 위 결과를 확정 명세·구현 계획·목표 결과 체크리스트로 변환한다.",
-    "암묵적으로 단계를 건너뛰거나 순서를 바꾸지 말고, 각 스킬 본문의 절차를 그대로 따른다.",
-    "인터뷰가 끝나 to-prd~grill-checklist까지 마치는 턴에서만 grill-checklist의 기계 판독 경계 안에 최종 목표 체크리스트를 한 번만 출력한다.",
+    "아래 파일들을 source of truth로 사용하라. 본문을 프롬프트에 재인용하지 말고 필요할 때 직접 읽어라.",
+    `- ${skillPath("grill-checklist")}`,
+    `- ${skillPath("grill-with-docs")}`,
+    `- ${skillPath("grilling")}`,
+    `- ${skillPath("domain-modeling")}`,
+    `- ${skillPath("to-prd")}`,
+    `- ${skillPath("to-issues")}`,
+    `- ${docs.issueTracker}`,
+    "필요할 때는 `read` 도구로 해당 파일을 직접 읽어라. `grep`으로 본문을 재생산하지 말고, 한 번에 하나씩 읽어라.",
+    "한 번에 하나의 질문만 하고, 아직 물을 질문이 남았으면 그 턴은 질문으로 끝내라.",
+    "이전 세션의 요약이나 추측을 섞지 말고, 위 파일과 현재 대화에서만 근거를 가져와라.",
     "</loop-agent-pipeline>",
     "",
     objective,
@@ -1839,48 +1986,12 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     // 명시적 /goal은 전제 누락을 에러로 안내하지만, armed 첫 메시지처럼
     // 암묵적으로 파이프라인에 태우는 경우엔 조용히 원본 입력을 통과시킨다.
     { explicit = true }: { explicit?: boolean } = {},
-  ): Promise<string | null> {
-    if (!ctx.isIdle()) {
-      ctx.ui.notify(
-        "loop-agent: 현재 에이전트 실행이 끝난 뒤 다시 시도하세요.",
-        "warning",
-      );
-      return null;
-    }
-    if (state.workflowId || state.processingWorkflowId) {
-      ctx.ui.notify(
-        "loop-agent: 이미 진행 중인 목표가 있습니다. 중단하려면 /loop-agent clear를 먼저 실행하세요.",
-        "warning",
-      );
-      return null;
-    }
+): Promise<string | null> {
+  if (!ensureWorkflowWorkspace(ctx, explicit)) return null;
 
-    // 새 프로젝트에는 docs 트리가 없으므로, 전제 검사 전에 규약 문서와 태스크
-    // 파일을 설치 폴더 템플릿에서 복사해 생성한다. 이미 있으면 건너뛴다. 원본
-    // 템플릿 자체가 없으면 파이프라인을 세울 수 없으니, 명시적 /goal에서는
-    // 에러로 안내하고 암묵적 첫 메시지에서는 조용히 통과시킨다.
-    try {
-      const created = ensureProjectDocs(ctx.cwd);
-      if (created.length > 0) {
-        ctx.ui.notify(
-          `loop-agent: 이 프로젝트에 이슈 트래커 문서를 생성했습니다 (${created.length}개): ${created.join(", ")}`,
-          "info",
-        );
-      }
-    } catch (error) {
-      if (explicit) {
-        const message = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(
-          `loop-agent: 이슈 트래커 문서를 생성하지 못했습니다: ${message}`,
-          "error",
-        );
-      }
-      return null;
-    }
-
-    // 상태를 바꾸기 전에 남은 전제 파일(파이프라인 스킬)을 확인한다. 문서는 위에서
-    // 생성했으므로, 여기서 걸리는 건 대개 설치 폴더의 스킬 파일 누락이다. 없으면
-    // 워크플로를 시작하지 않고, 암묵적 경로에서는 원본 입력을 그대로 흘려보낸다.
+  // 상태를 바꾸기 전에 남은 전제 파일(파이프라인 스킬)을 확인한다. 문서는 위에서
+  // 생성했으므로, 여기서 걸리는 건 대개 설치 폴더의 스킬 파일 누락이다. 없으면
+  // 워크플로를 시작하지 않고, 암묵적 경로에서는 원본 입력을 그대로 흘려보낸다.
     const missing = findMissingPipelinePrerequisite(ctx.cwd);
     if (missing) {
       if (explicit) {
@@ -1936,6 +2047,49 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     }
   }
 
+  async function startQuickWorkflow(
+    piApi: ExtensionAPI,
+    ctx: ExtensionContext,
+    objective: string,
+    explicit: boolean,
+  ): Promise<boolean> {
+    if (!ensureWorkflowWorkspace(ctx, explicit)) return false;
+
+    const workflowId = randomUUID();
+    const { checklist, prompt } = buildDirectCodingPrompt(objective, ctx.cwd);
+
+    state.armed = false;
+    state.autoMode = true;
+    state.reviewStage = "awaiting-execution";
+    state.checklist = checklist;
+    state.improvementRound = 0;
+    state.workflowId = workflowId;
+    persistWorkflowState(piApi, "quick-goal-started");
+
+    const modelSelected = await selectModel(
+      piApi,
+      ctx,
+      config.codingModel,
+      config.codingThinkingLevel,
+      "코드",
+    );
+    if (!modelSelected) {
+      state.autoMode = false;
+      state.reviewStage = "idle";
+      state.checklist = null;
+      state.workflowId = null;
+      persistWorkflowState(piApi, "quick-goal-model-failed");
+      return false;
+    }
+
+    ctx.ui.notify(
+      "loop-agent: 작은 작업을 직접 실행합니다. 계획/인터뷰 없이 코드 에이전트를 시작합니다.",
+      "info",
+    );
+    startExecutionReviewLoop(piApi, ctx, workflowId, prompt);
+    return true;
+  }
+
   // /goal 명령용: 개별 메시지로 계획 프롬프트를 주입한다.
   async function startGoalWorkflow(
     piApi: ExtensionAPI,
@@ -1972,11 +2126,16 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       return { action: "continue" };
     }
 
-    // 첫 세션 메시지도 /goal과 완전히 동일한 반자동 파이프라인을 탄다.
-    // 계획 프롬프트로 원본 입력을 치환해 주입하면 그릴링 인터뷰 → to-prd →
-    // to-issues → checklist → (agent_end가 감지) 구현·검증 루프로 이어진다.
+    if (isLikelyQuickTask(text)) {
+      const started = await startQuickWorkflow(pi, ctx, text, false);
+      if (started) {
+        return { action: "handled" };
+      }
+    }
+
+    // 작은 단일 작업은 계획 없이 바로 코드 에이전트로 보낼 수 있다.
+    // 그렇지 않으면 /goal과 같은 반자동 파이프라인으로 흘린다.
     // 준비 실패(바쁘/이미 진행 중/전제 파일 누락) 시에는 원본을 그대로 통과시킨다.
-    // 첫 메시지는 사용자가 명시한 목표가 아니므로 전제 누락을 조용히 흘려보낸다.
     const prompt = await prepareGoalPipeline(ctx, text, { explicit: false });
     if (!prompt) {
       return { action: "continue" };
@@ -2096,13 +2255,27 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("goal", {
     description:
-      "Start a semi-automated loop-agent workflow (interview with a human, then auto implement/verify). Usage: /goal <objective>",
+      "Start a semi-automated loop-agent workflow (interview with a human, then auto implement/verify). Usage: /goal [plan|direct] <objective>",
     handler: async (args, ctx) => {
-      const objective = normalizeArgs(args);
-      if (!objective) {
+      const rawObjective = normalizeArgs(args);
+      if (!rawObjective) {
         ctx.ui.notify("Usage: /goal <objective>", "warning");
         return;
       }
+
+      const mode = parseGoalMode(rawObjective);
+      const objective = mode?.objective ?? rawObjective;
+
+      if (mode?.mode === "direct") {
+        await startQuickWorkflow(pi, ctx, objective, true);
+        return;
+      }
+
+      if (!mode && isLikelyQuickTask(objective)) {
+        const started = await startQuickWorkflow(pi, ctx, objective, false);
+        if (started) return;
+      }
+
       await startGoalWorkflow(pi, ctx, objective);
     },
   });
