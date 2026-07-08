@@ -1,18 +1,18 @@
 {
   "lastChangelogVersion": "0.80.3",
   "theme": "dark",
-  "defaultProvider": "openai-codex",
-  "defaultModel": "gpt-5.4",
+  "defaultProvider": "litellm",
+  "defaultModel": "claude-sonnet-5",
   "defaultThinkingLevel": "high",
   "loopAgent": {
-    "planningModel": "openai-codex/gpt-5.4",
+    "planningModel": "litellm/claude-opus-4-8",
     "planningThinkingLevel": "high",
-    "codingModel": "openai-codex/gpt-5.4-mini",
-    "codingThinkingLevel": "xhigh",
-    "verifyingModel": "openai-codex/gpt-5.4",
+    "codingModel": "litellm/claude-sonnet-5",
+    "codingThinkingLevel": "medium",
+    "verifyingModel": "litellm/claude-opus-4-8",
     "verifyingThinkingLevel": "high",
-    "testModel": "openai-codex/gpt-5.4-mini",
-    "testThinkingLevel": "xhigh",
+    "testModel": "litellm/claude-sonnet-5",
+    "testThinkingLevel": "medium",
     "maxImprovementRounds": 3
   },
   "packages": [

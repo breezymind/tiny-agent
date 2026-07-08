@@ -5,7 +5,7 @@ import type {
   SessionCompactEvent,
   SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -61,37 +61,71 @@ function skillPath(skillName: string): string {
   return path.join(path.dirname(CONFIG_PATH), "skills", skillName, "SKILL.md");
 }
 
-// to-prd/to-issues are the issue tracker's implementation is delegated to this doc.
-// docs/agents/issue-tracker.md at the project root defines where/how issues are
-// published. CONFIG_PATH is settings.json, so its directory is the project root.
-const ISSUE_TRACKER_DOC_PATH = path.join(
-  path.dirname(CONFIG_PATH),
-  "docs",
-  "agents",
-  "issue-tracker.md",
-);
+// to-prd/to-issues는 이 문서의 규약에 따라 이슈를 발행한다. 이 문서와 아래
+// 태스크 트리는 "실행 중인 프로젝트"에 속하므로 에이전트 설치 폴더가 아니라
+// 프로젝트 루트(에이전트의 cwd) 기준으로 계산한다. 그래야 ~/Workspace/tetris
+// 처럼 임의의 프로젝트에서 pi를 실행해도 그 프로젝트의 문서를 본다.
+// 프로젝트별 문서/태스크 경로 묶음. root는 에이전트 실행 cwd(ctx.cwd)다.
+type ProjectDocPaths = {
+  issueTracker: string;
+  tasksBacklog: string;
+  tasksCurrent: string;
+  tasksArchiveDir: string;
+  changesDir: string;
+};
+function projectDocPaths(root: string): ProjectDocPaths {
+  const docs = path.join(root, "docs");
+  return {
+    issueTracker: path.join(docs, "agents", "issue-tracker.md"),
+    tasksBacklog: path.join(docs, "tasks", "backlog.md"),
+    tasksCurrent: path.join(docs, "tasks", "current.md"),
+    tasksArchiveDir: path.join(docs, "tasks", "archive"),
+    changesDir: path.join(docs, "changes"),
+  };
+}
 
-// 로컬 이슈 트래커 파일 트리(issue-tracker.md 규약과 일치). 코딩 에이전트가
-// 이 경로들을 직접 수정해 태스크 상태를 이동시킨다.
-const TASKS_BACKLOG_PATH = path.join(
-  path.dirname(CONFIG_PATH),
-  "docs",
-  "tasks",
-  "backlog.md",
-);
-const TASKS_CURRENT_PATH = path.join(
-  path.dirname(CONFIG_PATH),
-  "docs",
-  "tasks",
-  "current.md",
-);
-const TASKS_ARCHIVE_DIR = path.join(
-  path.dirname(CONFIG_PATH),
-  "docs",
-  "tasks",
-  "archive",
-);
-const CHANGES_DIR = path.join(path.dirname(CONFIG_PATH), "docs", "changes");
+// 새 프로젝트에는 docs 트리가 없다. 파이프라인이 요구하는 이슈 트래커 규약
+// 문서와 태스크 파일 트리를 프로젝트 루트에 자동 생성해, 빈 저장소에서도
+// /goal·첫 메시지 파이프라인이 곧바로 성립하게 한다. 템플릿 원본은 코드에
+// 인라인하지 않고 에이전트 설치 폴더의 templates/docs/ 아래 실제 파일로 두어
+// (스킬 본문을 파일로 주입하는 기존 관례와 동일) 콘텐츠와 코드를 분리한다.
+// 이 원본은 buildTaskTrackingInstructions가 강제하는 마커(## Backlog/
+// ## In progress/## Done, T-###, **Status:**)와 to-prd/to-issues 스킬의 이슈
+// 블록 형식에 정확히 일치해야 한다. 어긋나면 코딩 에이전트가 상태 파일을
+// 옮기지 못한다.
+const DOC_TEMPLATE_DIR = path.join(path.dirname(CONFIG_PATH), "templates", "docs");
+
+// 템플릿 원본(설치 폴더) → 프로젝트 대상 경로 매핑. archive/changes 디렉터리는
+// 코딩 에이전트가 완료·변경 시점에 월별 파일을 직접 만들므로 파일이 아닌 빈
+// 디렉터리만 확보한다.
+function docTemplateFiles(root: string): Array<[string, string]> {
+  const docs = projectDocPaths(root);
+  return [
+    [path.join(DOC_TEMPLATE_DIR, "agents", "issue-tracker.md"), docs.issueTracker],
+    [path.join(DOC_TEMPLATE_DIR, "tasks", "backlog.md"), docs.tasksBacklog],
+    [path.join(DOC_TEMPLATE_DIR, "tasks", "current.md"), docs.tasksCurrent],
+  ];
+}
+
+// 프로젝트에 문서 트리가 없으면 설치 폴더의 원본 템플릿을 복사해 생성한다.
+// 이미 있는 파일은 사용자 내용을 덮어쓰지 않도록 건너뛴다. 생성한 대상 경로
+// 목록을 돌려주어(빈 배열이면 이미 완비) 호출자가 사용자에게 알릴 수 있게 한다.
+// 원본 템플릿 파일이 없으면 파이프라인 전제 자체를 세울 수 없으므로 예외를
+// 그대로 전파한다(상위에서 잡아 안내).
+function ensureProjectDocs(root: string): string[] {
+  const created: string[] = [];
+  for (const [source, target] of docTemplateFiles(root)) {
+    if (fs.existsSync(target)) continue;
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(source, target);
+    created.push(target);
+  }
+  const docs = projectDocPaths(root);
+  for (const dir of [docs.tasksArchiveDir, docs.changesDir]) {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  }
+  return created;
+}
 
 // 현재 연-월(YYYY-MM). archive/changes의 월별 파일명과 changes 날짜에 쓴다.
 // 자식 코딩 프로세스가 아니라 부모 확장이 프롬프트를 구성할 때 계산한다.
@@ -105,21 +139,22 @@ function currentYearMonth(): string {
 // 코딩 에이전트(초기 실행·개선 라운드)에게 태스크 상태 파일 이동을
 // 강제하는 공통 지침. 파일 이동은 edit/write 도구를 가진 에이전트가
 // 수행해야 신뢰할 수 있으므로 확장이 직접 파싱하지 않고 지침을 주입한다.
-function buildTaskTrackingInstructions(): string {
+function buildTaskTrackingInstructions(root: string): string {
   const month = currentYearMonth();
+  const docs = projectDocPaths(root);
   return [
     "<task-tracking>",
-    `이 프로젝트의 이슈 트래커는 로컬 파일 트리다. 규약은 ${ISSUE_TRACKER_DOC_PATH} 참조.`,
+    `이 프로젝트의 이슈 트래커는 로컬 파일 트리다. 규약은 ${docs.issueTracker} 참조.`,
     "작업 시작·진행·완료에 따라 아래 파일을 반드시 직접 수정하라(edit/write). 외부 트래커를 찾지 말라.",
     "",
-    `1) 착수: 이번에 구현할 큰 태스크(T-###) 블록을 ${TASKS_BACKLOG_PATH}의 ## Backlog에서 잘라내`,
-    `   ${TASKS_CURRENT_PATH}의 ## In progress로 옮기고 **Status:**를 in-progress로 바꿔라. 해당 태스크가`,
+    `1) 착수: 이번에 구현할 큰 태스크(T-###) 블록을 ${docs.tasksBacklog}의 ## Backlog에서 잘라내`,
+    `   ${docs.tasksCurrent}의 ## In progress로 옮기고 **Status:**를 in-progress로 바꿔라. 해당 태스크가`,
     "   backlog에 아직 없다면(즉석 목표) current.md에 새 T-### 블록을 만들어 추가하라.",
     `2) 완료: 모든 수용 기준을 만족하면 current.md의 해당 T-### 블록을 잘라내`,
-    `   ${path.join(TASKS_ARCHIVE_DIR, `${month}.md`)}의 ## Done으로 옮기고 **Status:**를 done으로 바꿔라.`,
+    `   ${path.join(docs.tasksArchiveDir, `${month}.md`)}의 ## Done으로 옮기고 **Status:**를 done으로 바꿔라.`,
     "   블록 내용을 지우지 말고 이동만 하라(감사 추적). 아카이브 파일이 없으면 새로 생성하라.",
     `3) 사소한 변경: 큰 태스크가 아닌 부수 변경(오타·문구·리팩터·설정 등)은`,
-    `   ${path.join(CHANGES_DIR, `${month}.md`)}에 "- ${month}-DD: 요약 (관련 T-### 있으면 참조)" 형태로 append하라.`,
+    `   ${path.join(docs.changesDir, `${month}.md`)}에 "- ${month}-DD: 요약 (관련 T-### 있으면 참조)" 형태로 append하라.`,
     "</task-tracking>",
   ].join("\n");
 }
@@ -259,7 +294,9 @@ function shortenStatusLine(text: string, maxLength = 120): string {
 
 type StreamingRunResult = {
   code: number;
-  stdout: string;
+  // 자식이 --mode json으로 스트리밍한 이벤트에서 뽑아낸 최종 어시스턴트 텍스트.
+  // 과거 text 모드의 stdout(최종 응답)과 동일한 의미를 갖는다.
+  finalText: string;
   stderr: string;
 };
 
@@ -280,8 +317,265 @@ function formatProgressMessage(
     lines.push(`- 상세: ${details}`);
   }
 
-  lines.push("", transcript.slice(-20).join("\n") || "(아직 출력 없음)");
+  lines.push("", transcript.slice(-40).join("\n") || "(아직 출력 없음)");
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// 자식 pi(--mode json)의 NDJSON 이벤트 파싱
+//
+// text 모드는 실행이 끝난 뒤 최종 어시스턴트 텍스트만 한 번 stdout에 쓴다
+// (pi 코어 modes/print-mode.js). 그래서 부모가 stdout을 아무리 실시간으로
+// 파이프해도 진행 중에는 보여줄 게 없었다. json 모드는 session.subscribe의
+// 모든 이벤트를 한 줄에 하나씩 JSON으로 흘려보내므로, 이를 파싱하면 자식
+// 에이전트의 도구 호출·결과·어시스턴트 텍스트를 실시간으로 중계할 수 있다.
+// 이벤트 스키마는 pi-agent-core의 AgentEvent와 pi-ai의 AssistantMessageEvent다.
+// ---------------------------------------------------------------------------
+
+type JsonTextContent = { type?: string; text?: string };
+type JsonAssistantMessage = {
+  role?: string;
+  stopReason?: string;
+  errorMessage?: string;
+  content?: string | JsonTextContent[];
+};
+
+/** 어시스턴트 메시지 content(문자열 또는 블록 배열)에서 text만 이어붙인다. */
+function joinAssistantText(message: JsonAssistantMessage): string {
+  const content = message.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter(
+      (part): part is JsonTextContent =>
+        part?.type === "text" && typeof part.text === "string",
+    )
+    .map((part) => part.text as string)
+    .join("");
+}
+
+/** agent_end 이벤트의 messages 배열에서 마지막 어시스턴트 텍스트를 뽑는다. */
+function extractFinalTextFromMessages(
+  messages: JsonAssistantMessage[],
+): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== "assistant") continue;
+    return joinAssistantText(message).trim();
+  }
+  return "";
+}
+
+/** 도구 인자 객체에서 표시에 쓸 대표 필드만 골라 한 줄로 축약한다. */
+function summarizeToolArgs(args: unknown): string {
+  if (args == null) return "";
+  if (typeof args === "string") return shortenStatusLine(args, 80);
+  if (typeof args !== "object") return shortenStatusLine(String(args), 80);
+
+  const record = args as Record<string, unknown>;
+  // 자주 쓰는 도구 인자의 핵심 필드를 우선 노출한다.
+  const preferred = [
+    "command",
+    "path",
+    "file_path",
+    "filePath",
+    "pattern",
+    "query",
+    "url",
+    "cmd",
+  ];
+  for (const key of preferred) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return shortenStatusLine(value, 80);
+    }
+  }
+  try {
+    return shortenStatusLine(JSON.stringify(args), 80);
+  } catch {
+    return "";
+  }
+}
+
+/** 도구 결과(AgentToolResult 또는 임의 값)에서 표시용 텍스트를 축약한다. */
+function summarizeToolResult(result: unknown): string {
+  if (result == null) return "";
+  if (typeof result === "string") return shortenStatusLine(result, 80);
+  if (typeof result === "object") {
+    const record = result as Record<string, unknown>;
+    const content = record.content;
+    if (Array.isArray(content)) {
+      const text = content
+        .filter(
+          (part): part is JsonTextContent =>
+            (part as JsonTextContent)?.type === "text" &&
+            typeof (part as JsonTextContent).text === "string",
+        )
+        .map((part) => part.text as string)
+        .join(" ");
+      if (text.trim()) return shortenStatusLine(text, 80);
+    }
+    try {
+      return shortenStatusLine(JSON.stringify(result), 80);
+    } catch {
+      return "";
+    }
+  }
+  return shortenStatusLine(String(result), 80);
+}
+
+type ParsedEventLine = {
+  // progressTranscript에 남길 사람이 읽는 로그 라인(없으면 로그 미기록).
+  log?: string;
+  // 상태줄에 표시할 최신 활동(없으면 상태줄 유지).
+  status?: string;
+};
+
+// 하나의 자식 실행 동안 누적되는 이벤트 파싱 상태.
+type EventParseState = {
+  finalText: string;
+  // 도구 호출 ID → 도구명. end 이벤트에서 toolName이 없을 때 대비한 매핑.
+  toolNames: Map<string, string>;
+  // 어시스턴트 텍스트 델타 누적(로그가 아닌 상태줄 표시에 사용).
+  assistantBuffer: string;
+  // assistant 에러(stopReason error/aborted 또는 error 이벤트)를 감지했는지.
+  errorMessage: string | null;
+};
+
+/**
+ * NDJSON 한 줄(이미 JSON.parse된 이벤트)을 표시용 라인으로 변환하고,
+ * 최종 텍스트/에러 등 파싱 상태를 갱신한다.
+ */
+function handleJsonEvent(
+  event: Record<string, unknown>,
+  parse: EventParseState,
+): ParsedEventLine {
+  const type = typeof event.type === "string" ? event.type : "";
+
+  switch (type) {
+    case "tool_execution_start": {
+      const toolName =
+        typeof event.toolName === "string" ? event.toolName : "tool";
+      const toolCallId =
+        typeof event.toolCallId === "string" ? event.toolCallId : "";
+      if (toolCallId) parse.toolNames.set(toolCallId, toolName);
+      const argsSummary = summarizeToolArgs(event.args);
+      const line = argsSummary
+        ? `🔧 ${toolName}: ${argsSummary}`
+        : `🔧 ${toolName}`;
+      return { log: line, status: line };
+    }
+    case "tool_execution_update": {
+      const toolName =
+        typeof event.toolName === "string" ? event.toolName : "tool";
+      const partial = summarizeToolResult(event.partialResult);
+      if (!partial) return {};
+      // 부분 출력은 소음이 많아 상태줄로만 흘리고 로그에는 남기지 않는다.
+      return { status: `⏳ ${toolName}: ${partial}` };
+    }
+    case "tool_execution_end": {
+      const toolCallId =
+        typeof event.toolCallId === "string" ? event.toolCallId : "";
+      const toolName =
+        (typeof event.toolName === "string" && event.toolName) ||
+        parse.toolNames.get(toolCallId) ||
+        "tool";
+      const isError = event.isError === true;
+      const resultSummary = summarizeToolResult(event.result);
+      const icon = isError ? "❌" : "✅";
+      const line = resultSummary
+        ? `${icon} ${toolName} → ${resultSummary}`
+        : `${icon} ${toolName}`;
+      return { log: line, status: line };
+    }
+    case "message_update": {
+      const ame = event.assistantMessageEvent as
+        | { type?: string; delta?: string; content?: string }
+        | undefined;
+      if (!ame || typeof ame.type !== "string") return {};
+      if (ame.type === "text_delta" && typeof ame.delta === "string") {
+        parse.assistantBuffer += ame.delta;
+        // 델타는 상태줄로만 흘린다(토큰 단위라 로그로 남기면 폭발한다).
+        return { status: `💬 ${shortenStatusLine(parse.assistantBuffer, 80)}` };
+      }
+      if (ame.type === "text_end" && typeof ame.content === "string") {
+        parse.assistantBuffer = "";
+        const text = ame.content.trim();
+        if (!text) return {};
+        // 문단 단위로만 로그에 요약을 남긴다.
+        return { log: `💬 ${shortenStatusLine(text, 100)}` };
+      }
+      if (ame.type === "error") {
+        const errMsg = (ame as { error?: JsonAssistantMessage }).error;
+        const message = errMsg?.errorMessage || "요청 오류";
+        parse.errorMessage = message;
+        return { log: `⚠️ ${shortenStatusLine(message, 100)}` };
+      }
+      return {};
+    }
+    case "message_end":
+    case "turn_end": {
+      const message = (event.message ?? {}) as JsonAssistantMessage;
+      if (message.role === "assistant") {
+        const text = joinAssistantText(message).trim();
+        if (text) parse.finalText = text;
+        if (
+          message.stopReason === "error" ||
+          message.stopReason === "aborted"
+        ) {
+          parse.errorMessage =
+            message.errorMessage || `요청이 ${message.stopReason} 상태로 종료됨`;
+        }
+      }
+      return {};
+    }
+    case "agent_end": {
+      const messages = Array.isArray(event.messages)
+        ? (event.messages as JsonAssistantMessage[])
+        : [];
+      const text = extractFinalTextFromMessages(messages);
+      if (text) parse.finalText = text;
+      return {};
+    }
+    default:
+      return {};
+  }
+}
+
+// 자식은 항상 --mode json으로 실행해 이벤트를 실시간 파싱한다. 호출측 args에
+// --mode가 없으면 여기서 주입하고, text 등 다른 모드가 지정돼 있으면 json으로
+// 교체한다(진행 로그 스트리밍은 json 이벤트에만 존재하기 때문).
+function withJsonMode(args: string[]): string[] {
+  const result = [...args];
+  const modeIndex = result.indexOf("--mode");
+  if (modeIndex >= 0 && modeIndex + 1 < result.length) {
+    result[modeIndex + 1] = "json";
+    return result;
+  }
+  return ["--mode", "json", ...result];
+}
+
+// 실행 중인 자식 pi 프로세스 추적. 자식은 완전한 LLM 에이전트라서 화면에 안
+// 보이는 채 방치되면 그대로 시스템 부하가 된다. 부모 종료·새 세션 시작·clear
+// 시점에 여기 남은 자식을 반드시 회수한다.
+const activeChildren = new Set<ChildProcess>();
+
+// 부모 pi가 종료할 때 남은 자식을 고아로 남기지 않는다. 'exit' 핸들러는 동기
+// 코드만 실행되므로 신호 전송까지만 한다(SIGKILL 에스컬레이션은 불가능하지만,
+// 자식 pi는 SIGTERM으로 정상 종료한다).
+process.once("exit", () => {
+  for (const child of activeChildren) child.kill("SIGTERM");
+});
+
+/** 추적 중인 자식을 모두 종료하고 종료 신호를 보낸 개수를 돌려준다. */
+function killActiveChildren(): number {
+  let killed = 0;
+  for (const child of activeChildren) {
+    child.kill("SIGTERM");
+    killed += 1;
+  }
+  activeChildren.clear();
+  return killed;
 }
 
 async function runPiCommandWithProgress(
@@ -291,11 +585,15 @@ async function runPiCommandWithProgress(
   label: string,
   args: string[],
   timeoutMs: number,
+  // 부모 세션이 LLM 턴을 스트리밍하는 동안 sendMessage(triggerTurn:false)는
+  // 표시·기록 대신 steer 큐로 들어가 사라진다(pi 코어 sendCustomMessage).
+  // idle일 때만 진행 메시지를 보내고, 스트리밍 중엔 상태줄만 갱신한다.
+  isIdle?: () => boolean,
 ): Promise<StreamingRunResult> {
   ui.setStatus("loop-agent", `${label} 시작`);
 
   return await new Promise<StreamingRunResult>((resolve, reject) => {
-    const child = spawn("pi", args, {
+    const child = spawn("pi", withJsonMode(args), {
       cwd,
       env: {
         ...process.env,
@@ -303,8 +601,8 @@ async function runPiCommandWithProgress(
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
+    activeChildren.add(child);
 
-    let stdout = "";
     let stderr = "";
     const progressTranscript: string[] = [];
     let stdoutRemainder = "";
@@ -313,6 +611,13 @@ async function runPiCommandWithProgress(
     let finished = false;
     let timedOut = false;
 
+    const parse: EventParseState = {
+      finalText: "",
+      toolNames: new Map(),
+      assistantBuffer: "",
+      errorMessage: null,
+    };
+
     const clearStatus = (): void => {
       ui.setStatus("loop-agent", undefined);
     };
@@ -320,6 +625,7 @@ async function runPiCommandWithProgress(
     const finish = (result: StreamingRunResult): void => {
       if (finished) return;
       finished = true;
+      activeChildren.delete(child);
       clearInterval(heartbeat);
       clearTimeout(timer);
       clearStatus();
@@ -329,48 +635,32 @@ async function runPiCommandWithProgress(
     const fail = (error: Error): void => {
       if (finished) return;
       finished = true;
+      activeChildren.delete(child);
       clearInterval(heartbeat);
       clearTimeout(timer);
       clearStatus();
       reject(error);
     };
 
-    const updateStatus = (phase: string, chunk: string): void => {
-      const line = chunk.split(/\r?\n/).filter(Boolean).at(-1);
-      if (!line) return;
-      ui.setStatus(
-        "loop-agent",
-        `${label} ${phase}: ${shortenStatusLine(line)}`,
-      );
-    };
-
-    const ingestStream = (
-      stream: "stdout" | "stderr",
-      chunk: string,
-    ): void => {
-      lastActivity = Date.now();
-      const isStdout = stream === "stdout";
-      const current = (isStdout ? stdoutRemainder : stderrRemainder) + chunk;
-      const parts = current.split(/\r?\n/);
-      const remainder = parts.pop() ?? "";
-      if (isStdout) stdoutRemainder = remainder;
-      else stderrRemainder = remainder;
-
-      const lines = parts.map((line) => line.trim()).filter(Boolean);
-      if (lines.length === 0) return;
-
-      for (const line of lines) {
-        progressTranscript.push(`[${stream}] ${line}`);
+    // 파싱된 이벤트에서 나온 표시용 라인을 로그/상태줄로 흘려보낸다.
+    const emit = (parsed: ParsedEventLine): void => {
+      if (parsed.status) {
+        ui.setStatus("loop-agent", `${label}: ${parsed.status}`);
       }
-
+      if (!parsed.log) return;
+      progressTranscript.push(parsed.log);
+      // 스트리밍 중에는 steer 큐로 사라지므로 상태줄/누적 로그만 유지하고
+      // 메시지 전송은 건너뛴다. 다음 idle 시점의 메시지가 전체 누적 로그를
+      // 포함하므로 유실되지 않는다.
+      if (isIdle && !isIdle()) return;
       pi.sendMessage(
         {
           customType: "loop-agent-progress",
-          content: formatProgressMessage(label, stream, progressTranscript),
+          content: formatProgressMessage(label, "stdout", progressTranscript),
           display: true,
           details: {
             label,
-            stream,
+            stream: "stdout",
             lines: progressTranscript.length,
           },
         },
@@ -378,8 +668,44 @@ async function runPiCommandWithProgress(
       );
     };
 
+    // 자식 stdout은 개행 구분 JSON 이벤트 스트림이다. 완성된 줄만 파싱한다.
+    const ingestStdout = (chunk: string): void => {
+      lastActivity = Date.now();
+      const current = stdoutRemainder + chunk;
+      const parts = current.split(/\r?\n/);
+      stdoutRemainder = parts.pop() ?? "";
+      for (const raw of parts) {
+        const line = raw.trim();
+        if (!line) continue;
+        let event: Record<string, unknown>;
+        try {
+          event = JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          // JSON이 아닌 진단 출력은 그대로 로그에 남긴다.
+          emit({ log: shortenStatusLine(line, 200) });
+          continue;
+        }
+        emit(handleJsonEvent(event, parse));
+      }
+    };
+
+    // stderr는 사람이 읽는 진단/오류이므로 줄 단위로 로그에 남긴다.
+    const ingestStderr = (chunk: string): void => {
+      lastActivity = Date.now();
+      const current = stderrRemainder + chunk;
+      const parts = current.split(/\r?\n/);
+      stderrRemainder = parts.pop() ?? "";
+      for (const raw of parts) {
+        const line = raw.trim();
+        if (!line) continue;
+        emit({ log: `[stderr] ${shortenStatusLine(line, 200)}` });
+      }
+    };
+
     const heartbeat = setInterval(() => {
       if (finished) return;
+      // emit과 같은 이유: 스트리밍 중 sendMessage는 steer 큐로 사라진다.
+      if (isIdle && !isIdle()) return;
       const elapsedSeconds = Math.max(
         1,
         Math.floor((Date.now() - lastActivity) / 1000),
@@ -413,17 +739,13 @@ async function runPiCommandWithProgress(
     }, timeoutMs);
 
     child.stdout.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
-      stdout += text;
-      updateStatus("진행", text);
-      ingestStream("stdout", text);
+      ingestStdout(chunk.toString("utf8"));
     });
 
     child.stderr.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8");
       stderr += text;
-      updateStatus("오류 출력", text);
-      ingestStream("stderr", text);
+      ingestStderr(text);
     });
 
     child.once("error", (error) => {
@@ -441,39 +763,76 @@ async function runPiCommandWithProgress(
         return;
       }
 
-      const flushRemainder = (
-        stream: "stdout" | "stderr",
-        remainder: string,
-      ): void => {
-        const text = remainder.trim();
-        if (!text) return;
-        lastActivity = Date.now();
-        progressTranscript.push(`[${stream}] ${text}`);
-        pi.sendMessage(
-          {
-            customType: "loop-agent-progress",
-            content: formatProgressMessage(label, stream, progressTranscript),
-            display: true,
-            details: {
-              label,
-              stream,
-              lines: progressTranscript.length,
-            },
-          },
-          { triggerTurn: false },
-        );
-      };
+      // 마지막 줄에 개행이 없을 수 있으므로 남은 버퍼도 처리한다.
+      const stdoutTail = stdoutRemainder.trim();
+      if (stdoutTail) {
+        try {
+          emit(handleJsonEvent(JSON.parse(stdoutTail), parse));
+        } catch {
+          emit({ log: shortenStatusLine(stdoutTail, 200) });
+        }
+      }
+      const stderrTail = stderrRemainder.trim();
+      if (stderrTail) emit({ log: `[stderr] ${shortenStatusLine(stderrTail, 200)}` });
 
-      flushRemainder("stdout", stdoutRemainder);
-      flushRemainder("stderr", stderrRemainder);
+      // json 모드는 assistant 에러가 나도 프로세스 exit는 0일 수 있다. 파싱
+      // 단계에서 감지한 에러를 종료 코드로 승격해 호출측 계약(code!==0=실패)을 지킨다.
+      const exitCode = code ?? (signal ? 1 : 0);
+      const effectiveCode =
+        exitCode !== 0 ? exitCode : parse.errorMessage ? 1 : 0;
 
       finish({
-        code: code ?? (signal ? 1 : 0),
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
+        code: effectiveCode,
+        finalText: parse.finalText.trim(),
+        stderr: (parse.errorMessage
+          ? `${parse.errorMessage}\n${stderr}`
+          : stderr
+        ).trim(),
       });
     });
   });
+}
+
+// 동일 시점에 두 개의 워크플로 시작이 예약되지 않도록 막는 전이 플래그(비영속).
+let executionLoopPending = false;
+
+/**
+ * runExecutionReviewLoop를 이벤트 핸들러에서 분리해 실행한다.
+ *
+ * pi 코어는 agent_end 리스너가 모두 끝난 뒤에야 isStreaming을 해제하므로
+ * (pi-agent-core finishRun), 핸들러 안에서 워크플로 전체를 await하면 세션이
+ * 워크플로가 끝날 때까지(수십 분~수 시간) 스트리밍 상태로 고정된다. 그동안
+ * sendMessage(triggerTurn:false)는 화면 표시·세션 기록 대신 steer 큐로
+ * 들어가 진행 로그와 결과가 통째로 사라지고, 사용자에겐 멈춘 화면만 보인다.
+ * 그래서 핸들러는 이 함수를 호출만 하고 즉시 리턴하며, 실제 루프는 run이
+ * idle로 전이한 뒤 시작한다(scheduleLengthContinue와 같은 패턴).
+ */
+function startExecutionReviewLoop(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  workflowId: string,
+  initialCodingPrompt?: string,
+): void {
+  if (executionLoopPending) return;
+  executionLoopPending = true;
+  void (async () => {
+    try {
+      const deadline = Date.now() + LENGTH_CONTINUE_TIMEOUT_MS;
+      while (!ctx.isIdle() && Date.now() < deadline) {
+        await sleep(LENGTH_CONTINUE_POLL_MS);
+      }
+      if (!ctx.isIdle()) {
+        ctx.ui.notify(
+          "loop-agent: 세션이 idle로 전이되지 않아 워크플로 실행을 시작하지 못했습니다.",
+          "warning",
+        );
+        return;
+      }
+      await runExecutionReviewLoop(pi, ctx, workflowId, initialCodingPrompt);
+    } finally {
+      executionLoopPending = false;
+    }
+  })();
 }
 
 // 동일 시점에 두 개의 자동 재개가 예약되지 않도록 막는 전이 플래그(비영속).
@@ -614,6 +973,27 @@ function resolveTestThinkingLevel(): ThinkingLevel | null {
  * 확장이 직접 시작하는 턴에서는 Pi 코어와 동일한 형태의 skill 블록을 만들어
  * 전달해야 실제 스킬 지침이 모델 문맥에 포함된다.
  */
+/**
+ * 계획 파이프라인이 요구하는 스킬 파일과 issue-tracker 문서가 모두 존재하고
+ * 읽을 수 있는지 확인한다. 하나라도 없으면 그 경로를, 모두 갖춰졌으면 null을
+ * 돌려준다. 워크플로 상태를 바꾸기 전에 호출해, 전제가 갖춰지지 않은 환경에서
+ * 첫 메시지를 파이프라인으로 삼켰다가 곧바로 실패하는 일을 막는다.
+ */
+function findMissingPipelinePrerequisite(root: string): string | null {
+  const required = [
+    ...PLANNING_PIPELINE_SKILLS.map((skillName) => skillPath(skillName)),
+    projectDocPaths(root).issueTracker,
+  ];
+  for (const filePath of required) {
+    try {
+      fs.accessSync(filePath, fs.constants.R_OK);
+    } catch {
+      return filePath;
+    }
+  }
+  return null;
+}
+
 function buildSkillBlock(skillName: string, skillFilePath: string): string {
   const source = fs.readFileSync(skillFilePath, "utf8");
   const body = source.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "").trim();
@@ -636,6 +1016,7 @@ function buildSkillBlock(skillName: string, skillFilePath: string): string {
 function buildPlanningPipelinePrompt(
   objective: string,
   workflowId: string,
+  root: string,
 ): string {
   const skillBlocks = PLANNING_PIPELINE_SKILLS.map((skillName) =>
     buildSkillBlock(skillName, skillPath(skillName)),
@@ -644,9 +1025,10 @@ function buildPlanningPipelinePrompt(
   // to-prd/to-issues는 "이슈 트래커가 제공되었다"는 전제로 동작하므로,
   // 발행 규약(issue-tracker.md)을 반드시 프롬프트에 함께 주입한다. 문서가
   // 없으면 발행 대상을 알 수 없으므로 명시적으로 실패시켜 /goal을 멈춘다.
-  const issueTrackerDoc = fs.readFileSync(ISSUE_TRACKER_DOC_PATH, "utf8").trim();
+  const issueTrackerPath = projectDocPaths(root).issueTracker;
+  const issueTrackerDoc = fs.readFileSync(issueTrackerPath, "utf8").trim();
   const issueTrackerBlock = [
-    `<issue-tracker location="${ISSUE_TRACKER_DOC_PATH}">`,
+    `<issue-tracker location="${issueTrackerPath}">`,
     "to-prd와 to-issues가 이슈를 발행·조회할 때 따라야 하는 유일한 규약이다.",
     "외부 트래커 CLI나 MCP를 가정하지 말고 이 문서의 로컬 작업 목록 파일 규약만 사용하라.",
     "",
@@ -784,7 +1166,14 @@ async function selectModel(
       ok = false;
     } else {
       const selected = await pi.setModel(model);
-      if (!selected) {
+      if (selected) {
+        // 모델 전환은 사용자가 체감하는 상태 변화이므로, 어떤 역할로 어떤
+        // 모델로 바뀌었는지 항상 알린다.
+        ctx.ui.notify(
+          `loop-agent: ${role} 모델로 전환했습니다: ${modelName}`,
+          "info",
+        );
+      } else {
         ctx.ui.notify(
           `loop-agent: ${role} 모델 인증을 사용할 수 없습니다: ${modelName}`,
           "error",
@@ -888,10 +1277,12 @@ function extractReviewResult(report: string): ReviewResult {
 async function runIndependentReview(
   pi: ExtensionAPI,
   cwd: string,
+  ui: Pick<ExtensionContext["ui"], "setStatus">,
   checklist: string,
   modelName: string | null,
   thinkingLevel: ThinkingLevel | null,
   testReport: string | null,
+  isIdle?: () => boolean,
 ): Promise<string> {
   const prompt = [
     "당신은 구현 에이전트와 독립된 결과 검수 에이전트다.",
@@ -917,7 +1308,7 @@ async function runIndependentReview(
 
   const args = [
     "--mode",
-    "text",
+    "json",
     "--print",
     "--no-session",
     "--no-extensions",
@@ -934,10 +1325,11 @@ async function runIndependentReview(
   const result = await runPiCommandWithProgress(
     pi,
     cwd,
-    pi.ui,
+    ui,
     "독립 검수 에이전트",
     args,
     REVIEW_TIMEOUT_MS,
+    isIdle,
   );
 
   if (result.code !== 0) {
@@ -945,7 +1337,7 @@ async function runIndependentReview(
     throw new Error(`독립 검수 에이전트 실행 실패: ${reason}`);
   }
 
-  const report = result.stdout.trim();
+  const report = result.finalText.trim();
   if (!report)
     throw new Error("독립 검수 에이전트가 빈 보고서를 반환했습니다.");
   return report;
@@ -964,10 +1356,12 @@ async function runValidatedReview(
     const report = await runIndependentReview(
       pi,
       ctx.cwd,
+      ctx.ui,
       checklist,
       resolveVerifyingModel(),
       resolveVerifyingThinkingLevel(),
       testReport,
+      ctx.isIdle,
     );
     try {
       return { report, result: extractReviewResult(report) };
@@ -999,7 +1393,7 @@ async function runCodingAgent(
 ): Promise<string> {
   const args = [
     "--mode",
-    "text",
+    "json",
     "--print",
     "--no-session",
     "--no-skills",
@@ -1022,13 +1416,14 @@ async function runCodingAgent(
     "코드 에이전트",
     args,
     CODING_TIMEOUT_MS,
+    ctx.isIdle,
   );
   if (result.code !== 0) {
     const reason = result.stderr.trim() || `exit code ${result.code}`;
     throw new Error(`코드 에이전트 실행 실패: ${reason}`);
   }
 
-  const output = result.stdout.trim();
+  const output = result.finalText.trim();
   if (!output) throw new Error("코드 에이전트가 빈 결과를 반환했습니다.");
   return output;
 }
@@ -1056,7 +1451,7 @@ async function runTestAgent(
 
   const args = [
     "--mode",
-    "text",
+    "json",
     "--print",
     "--no-session",
     "--no-skills",
@@ -1080,13 +1475,14 @@ async function runTestAgent(
     "테스트 에이전트",
     args,
     TEST_TIMEOUT_MS,
+    ctx.isIdle,
   );
   if (result.code !== 0) {
     const reason = result.stderr.trim() || `exit code ${result.code}`;
     throw new Error(`테스트 에이전트 실행 실패: ${reason}`);
   }
 
-  const output = result.stdout.trim();
+  const output = result.finalText.trim();
   if (!output) throw new Error("테스트 에이전트가 빈 결과를 반환했습니다.");
   return output;
 }
@@ -1095,6 +1491,7 @@ function buildImprovementPrompt(
   result: ReviewResult,
   checklist: string,
   round: number,
+  root: string,
 ): string {
   const failedItems = result.failedItems
     .map(
@@ -1110,7 +1507,7 @@ function buildImprovementPrompt(
     "",
     buildImplementSkillGuidance(),
     "",
-    buildTaskTrackingInstructions(),
+    buildTaskTrackingInstructions(root),
     "이 태스크는 이미 current.md에 있을 수 있으니, 수용 기준을 모두 만족한 뒤에만 archive로 이동하세요.",
     "",
     failedItems,
@@ -1256,6 +1653,7 @@ async function runExecutionReviewLoop(
         result,
         state.checklist,
         state.improvementRound,
+        ctx.cwd,
       );
       ctx.ui.notify(
         `loop-agent: 실패 항목 개선 ${state.improvementRound}/${config.maxImprovementRounds}차를 준비합니다.`,
@@ -1337,6 +1735,9 @@ function applyGateCommand(command: string, pi: ExtensionAPI): boolean {
       state.improvementRound = 0;
       state.autoMode = false;
       state.workflowId = null;
+      // 상태만 리셋하면 이미 spawn된 자식 에이전트는 보이지 않는 채 계속
+      // 실행되므로(부하), clear는 자식 프로세스까지 함께 회수해야 한다.
+      killActiveChildren();
       persistWorkflowState(pi, "cleared");
       return true;
     default:
@@ -1356,6 +1757,15 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     if (freshSession) {
       // 확장 모듈은 프로세스 동안 유지될 수 있으므로 새 세션에서 이전 작업의
       // 체크리스트와 검수 상태가 유출되지 않게 명시적으로 초기화한다.
+      // state만 리셋하면 이전 워크플로의 자식 에이전트가 고아로 남아 보이지
+      // 않는 부하가 되므로(가드 isCurrentWorkflow가 결과만 버림), 먼저 회수한다.
+      const killed = killActiveChildren();
+      if (killed > 0) {
+        ctx.ui.notify(
+          `loop-agent: 이전 워크플로의 자식 에이전트 ${killed}개를 종료했습니다.`,
+          "warning",
+        );
+      }
       state.reviewStage = "idle";
       state.checklist = null;
       state.improvementRound = 0;
@@ -1381,13 +1791,14 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       ) {
         // 중단 지점에서 코드를 무조건 재실행하면 이미 반영된 변경을 중복 적용할
         // 수 있으므로 먼저 현재 파일 상태를 검수하고 부족한 항목만 개선한다.
-        await runExecutionReviewLoop(pi, ctx, state.workflowId);
+        // session_start 핸들러를 워크플로 종료까지 붙들지 않도록 분리 실행한다.
+        startExecutionReviewLoop(pi, ctx, state.workflowId);
       }
     }
 
     if (state.armed) {
       ctx.ui.notify(
-        "loop-agent: 다음 첫 메시지를 grill-checklist로 확장합니다.",
+        "loop-agent: 다음 첫 메시지를 계획 파이프라인(grill-with-docs → to-prd → to-issues → grill-checklist)으로 확장합니다.",
         "info",
       );
     }
@@ -1414,7 +1825,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
         "loop-agent: 컴팩션 이후 진행 중이던 워크플로를 이어서 실행합니다.",
         "info",
       );
-      await runExecutionReviewLoop(pi, ctx, state.workflowId);
+      startExecutionReviewLoop(pi, ctx, state.workflowId);
     }
   });
 
@@ -1425,6 +1836,9 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
   async function prepareGoalPipeline(
     ctx: ExtensionContext,
     objective: string,
+    // 명시적 /goal은 전제 누락을 에러로 안내하지만, armed 첫 메시지처럼
+    // 암묵적으로 파이프라인에 태우는 경우엔 조용히 원본 입력을 통과시킨다.
+    { explicit = true }: { explicit?: boolean } = {},
   ): Promise<string | null> {
     if (!ctx.isIdle()) {
       ctx.ui.notify(
@@ -1438,6 +1852,43 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
         "loop-agent: 이미 진행 중인 목표가 있습니다. 중단하려면 /loop-agent clear를 먼저 실행하세요.",
         "warning",
       );
+      return null;
+    }
+
+    // 새 프로젝트에는 docs 트리가 없으므로, 전제 검사 전에 규약 문서와 태스크
+    // 파일을 설치 폴더 템플릿에서 복사해 생성한다. 이미 있으면 건너뛴다. 원본
+    // 템플릿 자체가 없으면 파이프라인을 세울 수 없으니, 명시적 /goal에서는
+    // 에러로 안내하고 암묵적 첫 메시지에서는 조용히 통과시킨다.
+    try {
+      const created = ensureProjectDocs(ctx.cwd);
+      if (created.length > 0) {
+        ctx.ui.notify(
+          `loop-agent: 이 프로젝트에 이슈 트래커 문서를 생성했습니다 (${created.length}개): ${created.join(", ")}`,
+          "info",
+        );
+      }
+    } catch (error) {
+      if (explicit) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(
+          `loop-agent: 이슈 트래커 문서를 생성하지 못했습니다: ${message}`,
+          "error",
+        );
+      }
+      return null;
+    }
+
+    // 상태를 바꾸기 전에 남은 전제 파일(파이프라인 스킬)을 확인한다. 문서는 위에서
+    // 생성했으므로, 여기서 걸리는 건 대개 설치 폴더의 스킬 파일 누락이다. 없으면
+    // 워크플로를 시작하지 않고, 암묵적 경로에서는 원본 입력을 그대로 흘려보낸다.
+    const missing = findMissingPipelinePrerequisite(ctx.cwd);
+    if (missing) {
+      if (explicit) {
+        ctx.ui.notify(
+          `loop-agent: 파이프라인 전제 파일이 없어 목표를 시작할 수 없습니다: ${missing}`,
+          "error",
+        );
+      }
       return null;
     }
 
@@ -1471,7 +1922,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       "info",
     );
     try {
-      return buildPlanningPipelinePrompt(objective, workflowId);
+      return buildPlanningPipelinePrompt(objective, workflowId, ctx.cwd);
     } catch (error) {
       state.autoMode = false;
       state.workflowId = null;
@@ -1524,8 +1975,9 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     // 첫 세션 메시지도 /goal과 완전히 동일한 반자동 파이프라인을 탄다.
     // 계획 프롬프트로 원본 입력을 치환해 주입하면 그릴링 인터뷰 → to-prd →
     // to-issues → checklist → (agent_end가 감지) 구현·검증 루프로 이어진다.
-    // 준비 실패(바쁘/이미 진행 중/스킬 읽기 실패) 시에는 원본을 그대로 통과시킨다.
-    const prompt = await prepareGoalPipeline(ctx, text);
+    // 준비 실패(바쁘/이미 진행 중/전제 파일 누락) 시에는 원본을 그대로 통과시킨다.
+    // 첫 메시지는 사용자가 명시한 목표가 아니므로 전제 누락을 조용히 흘려보낸다.
+    const prompt = await prepareGoalPipeline(ctx, text, { explicit: false });
     if (!prompt) {
       return { action: "continue" };
     }
@@ -1613,7 +2065,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
           "",
           buildImplementSkillGuidance(),
           "",
-          buildTaskTrackingInstructions(),
+          buildTaskTrackingInstructions(ctx.cwd),
           "",
           planningResponse,
         ].join("\n");
@@ -1621,7 +2073,9 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
           "loop-agent: 계획과 체크리스트가 확정되어 코드 에이전트를 자동 실행합니다.",
           "info",
         );
-        await runExecutionReviewLoop(pi, ctx, workflowId, codingPrompt);
+        // agent_end 안에서 await하면 isStreaming이 워크플로 종료까지 풀리지
+        // 않아 진행 메시지가 전부 steer 큐로 사라진다. 분리 실행이 필수다.
+        startExecutionReviewLoop(pi, ctx, workflowId, codingPrompt);
         return;
       }
 
@@ -1637,7 +2091,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
 
     const workflowId = state.workflowId;
     if (!workflowId) return;
-    await runExecutionReviewLoop(pi, ctx, workflowId);
+    startExecutionReviewLoop(pi, ctx, workflowId);
   });
 
   pi.registerCommand("goal", {
@@ -1778,7 +2232,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
           return;
         }
         state.workflowId ??= randomUUID();
-        await runExecutionReviewLoop(pi, ctx, state.workflowId);
+        startExecutionReviewLoop(pi, ctx, state.workflowId);
         return;
       }
 
