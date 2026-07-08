@@ -28,6 +28,8 @@ export type CommandInvocation = {
 export const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 export const MCP_CONFIG_PATH = join(AGENT_DIR, "mcp.json");
 export const COMMAND_TIMEOUT_MS = 10_000;
+const CODEGRAPH_DIR_NAME = ".codegraph";
+const CODEGRAPH_DB_NAME = "codegraph.db";
 
 // 실제 등록된 MCP 실행 파일을 그대로 사용하기 위해 mcp.json을 읽는다.
 // 설정 파일이 없거나 JSON이 깨졌다면 빈 설정을 반환해 호출부가 조용히 건너뛰게 한다.
@@ -49,6 +51,12 @@ export function canonicalPath(path: string): string {
   } catch {
     return resolved;
   }
+}
+
+// 프로젝트 루트 안에 이미 만들어진 CodeGraph 인덱스가 있는지 직접 확인한다.
+// MCP 설정이 비어 있어도 로컬 인덱스 파일이 있으면 그래프는 사용할 수 있어야 한다.
+export function hasLocalCodegraphIndex(projectRoot: string): boolean {
+  return existsSync(join(projectRoot, CODEGRAPH_DIR_NAME, CODEGRAPH_DB_NAME));
 }
 
 // 하위 디렉터리에서 Pi를 실행해도 저장소 전체를 하나의 프로젝트로 다루도록
@@ -108,13 +116,19 @@ export function resolveCodegraphCli(config: McpConfig): CommandInvocation | unde
   return undefined;
 }
 
-// MCP 설정에서 실제 CodeGraph CLI 실행 방법을 구해 projectRoot의 초기화 상태를
-// 확인한다. 실행 방법을 찾지 못하거나 상태 조회가 실패하면 false(fail open).
+// projectRoot 안에 이미 생성된 CodeGraph 인덱스가 있으면 즉시 true를 반환한다.
+// 로컬 인덱스가 없을 때만 MCP 설정에서 실제 CodeGraph CLI 실행 방법을 구해
+// projectRoot의 초기화 상태를 확인한다. 실행 방법을 찾지 못하거나 상태 조회가
+// 실패하면 false(fail open).
 export async function checkCodegraphIndexed(
   pi: ExtensionAPI,
   projectRoot: string,
   config: McpConfig,
 ): Promise<boolean> {
+  if (hasLocalCodegraphIndex(projectRoot)) {
+    return true;
+  }
+
   const invocation = resolveCodegraphCli(config);
   if (invocation === undefined) return false;
 

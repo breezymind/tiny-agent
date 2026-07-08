@@ -29,6 +29,11 @@
 - 현재 세션에 노출된 Skill 중 작업에 직접 필요한 것만 선택한다.
 - 사용자가 Skill을 지정하면 해당 Skill의 지침을 우선한다.
 - 프로젝트 설정에서 기술 스택을 확인한 뒤 일치하는 Skill만 사용한다.
+- Flutter 프로젝트에서는 아래 Flutter 전용 Skill을 먼저 고정적으로 검토한다.
+  - 반응형/대응형 레이아웃, 화면 크기 대응, large screen UI: `flutter-build-responsive-layout`
+  - RenderFlex overflow, unbounded constraints, 레이아웃 예외: `flutter-fix-layout-issues`
+  - integration_test 추가, UI 자동화, 사용자 흐름 테스트: `flutter-add-integration-test`
+- Flutter 작업은 위 세 Skill에 먼저 매칭하고, 해당하지 않을 때만 일반 구현/테스트 Skill을 쓴다.
 - 단순 질문, 설명, 번역, 짧은 문구 수정에는 Skill을 억지로 적용하지 않는다.
 - 요구사항 정리나 PRD 작성에는 `prd-creator`를 사용한다.
 - 범위, 완료 기준, 핵심 동작이 불명확하면 구현이나 PRD보다 먼저 `grilling` 또는 직접 질문으로 확인한다.

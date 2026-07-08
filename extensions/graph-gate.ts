@@ -477,10 +477,6 @@ export default function graphFirstGate(pi: ExtensionAPI) {
 
     // permissive 모드에서는 첫 차단만 하고, 같은 턴의 후속 fallback 검색은 허용한다.
     if (!state.strict && state.blockedOnceInTurn) {
-      ctx.ui.notify(
-        "Graph discovery was not completed. Allowing fallback search after one block.",
-        "warning",
-      );
       return;
     }
 
