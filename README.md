@@ -49,6 +49,38 @@ Pi 코어를 그대로 두고, 그 위에 전역 에이전트 규칙 · 확장(e
 각 단계에 서로 다른 모델을 배정할 수 있습니다(`settings.json`의 `loopAgent`):
 계획·검증은 `claude-opus-4-8`, 코딩·테스트는 `claude-sonnet-5`처럼 단계별로 나눠 씁니다.
 
+### 계획 단계 산출물이 유지보수에 주는 영향
+
+계획 단계의 각 스킬은 대화만 진행하는 게 아니라 매번 파일·이슈트래커 산출물을 남깁니다.
+이 산출물이 세션이 끊기거나 사람이 바뀌어도 "왜/무엇을/언제 끝났다고 판단하는지"를
+재추론 없이 복원할 수 있게 해주는 것이 이 파이프라인의 실질적인 유지보수 효과입니다.
+
+- **`grill-with-docs`** — 한 번에 하나씩 질문·답변을 주고받아 모호함을 없애는 동시에
+  **ADR**과 **용어집**을 생성합니다. 결정의 이유가 대화 로그에만 남지 않고 `docs/`에
+  파일로 남아, 이후 이 코드를 만지는 사람(또는 에이전트)이 결정을 다시 추론하지 않고
+  ADR을 읽으면 됩니다. 용어집은 이후 PRD·이슈·코드에서 같은 단어를 같은 의미로 쓰도록
+  강제합니다.
+- **`to-prd`** — 인터뷰가 끝난 뒤 추가 질문 없이 대화 맥락만으로 PRD를 작성해
+  `docs/tasks/backlog.md`에 발행합니다. 합의된 범위(Problem/Solution/User Stories/
+  Implementation Decisions/Testing Decisions/Out of Scope)가 채팅 밖의 git으로
+  추적되는 파일로 고정되어, 세션이 압축·종료돼도 범위가 증발하지 않고 diff로 리뷰할
+  수 있는 산출물이 됩니다.
+- **`to-issues`** — PRD를 계층별이 아니라 끝단까지 관통하는 tracer-bullet 수직 슬라이스로
+  쪼개 `docs/tasks/backlog.md`에 발행합니다. 각 슬라이스는 독립적으로 데모·검증
+  가능하고 의존관계(`Blocked by`)가 명시되어, 나중에 문제가 생겼을 때 어느 슬라이스가
+  무엇을 바꿨는지 이슈 단위로 추적할 수 있습니다. 큰 PR 하나가 아니라 작고 완결된
+  단위로 히스토리가 쌓여 롤백·bisect·리뷰 단위가 작아집니다.
+- **`grill-checklist`** — 위 세 단계의 산출물(합의된 명세, ADR·용어집, PRD, 이슈)을
+  "정상 동작한다" 같은 비측정 표현 없이 검증 가능한 체크리스트로 변환합니다. 이 체크리스트가
+  이후 자동 `implement → test → review` 루프의 유일한 판정 기준이 되어, 루프가 반복되는
+  동안 범위가 슬금슬금 넓어지거나 좁아지는 걸 막는 앵커 역할을 합니다. 독립 검수 에이전트가
+  주관적 판단 대신 체크리스트 통과/실패로만 판정하므로, 나중에 "이 기능이 원래 뭘 하기로
+  했었지?"를 체크리스트만 보고 재구성할 수 있습니다.
+
+다만 이 구조는 코드를 짜기 전에 인터뷰·PRD·이슈 분해라는 오버헤드를 필요로 하고,
+`docs/tasks/backlog.md`·ADR·용어집 같은 산출물이 최신 상태로 유지되지 않으면 낡은 문서가
+오히려 혼란을 더할 수 있다는 대가가 있습니다.
+
 ## 구성 요소
 
 ### 에이전트 규칙 — `AGENT.md`
@@ -61,9 +93,7 @@ Pi 코어를 그대로 두고, 그 위에 전역 에이전트 규칙 · 확장(e
 
 Pi에 기능을 더하는 TypeScript 확장입니다.
 
-- **`loop-agent.ts`** — 새 세션의 첫 메시지 또는 `/goal`을 자동 계획 파이프라인으로 감쌉니다.
-  한 턴에서 `grill-with-docs → to-prd → to-issues → grill-checklist` 순으로 계획을 세우고,
-  체크리스트가 생성되면 `implement → test → review` 루프로 이어집니다.
+- **`loop-agent.ts`** — 위 "반자동 파이프라인"을 구현하는 확장입니다.
 - **`graph-gate.ts`** — grep/read 같은 원시 검색보다 CodeGraph 도구를 먼저 쓰도록 강제하는
   그래프 우선 게이트입니다. 인덱스가 있을 때만 작동하며 `/graph-gate` 명령으로 모드를 바꿉니다.
 - **`auto-index.ts`** — 신규 프로젝트를 자동으로 CodeGraph 인덱싱합니다.
@@ -72,28 +102,20 @@ Pi에 기능을 더하는 TypeScript 확장입니다.
 
 ### 스킬 — `skills/`
 
-특정 작업에 특화된 지침 모음입니다. 주요 스킬:
+파이프라인 각 단계(계획/구현/리뷰/테스트)에 특화된 지침 모음입니다. 주요 스킬:
 
 | 분류 | 스킬 |
 | --- | --- |
-| 계획 | `grill-with-docs`, `grill-checklist`, `grilling`, `prd-creator`, `to-prd`, `to-issues`, `domain-modeling` |
-| 구현 | `implement`, `tdd`, `component-refactoring` |
-| 리뷰 | `code-review`, `frontend-code-review`, `web-design-guidelines` |
-| 테스트 | `frontend-testing`, `vitest-best-practices`, `e2e-tester` |
-| 스택별 | `postgres`, `mysql`, `vercel-react-best-practices`, `flutter-*` |
-| 리서치·메타 | `research`, `skill-creator` |
+| 계획 | `grill-with-docs`, `grill-checklist`, `grilling`, `to-prd`, `to-issues`, `domain-modeling` |
+| 구현 | `implement`, `tdd` |
+| 리뷰 | `code-review` |
+| 테스트 | `frontend-testing`, `e2e-tester` |
 
-### 문서 — `docs/`
-
-- `docs/tasks/` — 진행 중 작업(`current.md`), 백로그(`backlog.md`), 아카이브
-- `docs/changes/` — 변경 이력
-- `docs/agents/` — 에이전트별 운영 문서
+그 외 스택별·리서치용 스킬은 `skills/` 디렉토리를 참고하세요.
 
 ### 설정 파일
 
 - **`settings.json`** — 기본 프로바이더/모델, `loopAgent` 단계별 모델(계획·코딩·검증·테스트) 설정
-- **`mcp.json`** — MCP 서버 설정 (`codegraph`, `codebase-memory-mcp`) *(로컬 전용, 커밋 제외)*
-- **`skills-lock.json`** — 스킬 버전 잠금
 
 ## 요구 사항
 
