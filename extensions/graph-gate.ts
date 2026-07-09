@@ -96,6 +96,7 @@ const DOCUMENT_READ_PREFIXES = [
 
 const DOCUMENT_READ_NAMES = new Set([
   "AGENT.md",
+  "AGENTS.md",
   "CONTEXT.md",
   "README.md",
   "package.json",
@@ -167,6 +168,19 @@ function isAllowlistedDocumentPath(path: string): boolean {
 
   const baseName = normalized.split("/").pop() ?? normalized;
   if (DOCUMENT_READ_NAMES.has(baseName)) return true;
+
+  return false;
+}
+
+function isAllowlistedDocumentCommandSegment(segment: string): boolean {
+  const tokens = stripKnownWrappers(tokenizeCommand(segment));
+  const [verb, ...args] = tokens;
+
+  if (!verb || args.length === 0) return false;
+
+  if (verb === "cat" || verb === "read") {
+    return args.every(isAllowlistedDocumentPath);
+  }
 
   return false;
 }
@@ -374,6 +388,10 @@ function isBlockedSearchCommand(command: string): boolean {
   // 안전한 단일 명령은 허용한다.
   // 다만 파이프/체인으로 연결된 경우에는 각 세그먼트를 따로 봐야 한다.
   if (segments.length === 1 && isSafeCommandSegment(segments[0])) {
+    return false;
+  }
+
+  if (segments.every(isAllowlistedDocumentCommandSegment)) {
     return false;
   }
 
