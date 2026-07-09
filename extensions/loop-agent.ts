@@ -9,9 +9,9 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
-// loop-agent: 새 세션의 첫 메시지 또는 /goal을 자동 계획 파이프라인으로 감싸
+// loop-agent: 새 세션의 첫 메시지 또는 /hard-goal을 자동 계획 파이프라인으로 감싸
 // 하나의 턴에서 grill-with-docs → to-prd → to-issues → grill-checklist
 // 순서로 수행한다. 마지막 grill-checklist가 기계 판독 경계 안에 목표
 // 체크리스트를 출력하면, 그 뒤 확장이 implement→test→review 루프를 이어간다.
@@ -42,10 +42,15 @@ const CHECKLIST_END = "<!-- grill-checklist:end -->";
 const WORKFLOW_MARKER_PREFIX = "<!-- loop-agent-workflow:";
 const REVIEW_START = "<!-- grill-review:start -->";
 const REVIEW_END = "<!-- grill-review:end -->";
+const TEST_RESULT_START = "<!-- loop-agent-test-result:start -->";
+const TEST_RESULT_END = "<!-- loop-agent-test-result:end -->";
+const PARALLEL_TASKS_START = "<!-- loop-agent-parallel-tasks:start -->";
+const PARALLEL_TASKS_END = "<!-- loop-agent-parallel-tasks:end -->";
 const REVIEW_TIMEOUT_MS = 10 * 60 * 1000;
 const CODING_TIMEOUT_MS = 30 * 60 * 1000;
 const TEST_TIMEOUT_MS = 15 * 60 * 1000;
 const REVIEW_FORMAT_RETRIES = 2;
+const MAX_PARALLEL_CODING_TASKS = 4;
 const CONFIG_PATH = path.join(
   process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent"),
   "settings.json",
@@ -86,7 +91,7 @@ function projectDocPaths(root: string): ProjectDocPaths {
 
 // 새 프로젝트에는 docs 트리가 없다. 파이프라인이 요구하는 이슈 트래커 규약
 // 문서와 태스크 파일 트리를 프로젝트 루트에 자동 생성해, 빈 저장소에서도
-// /goal·첫 메시지 파이프라인이 곧바로 성립하게 한다. 템플릿 원본은 코드에
+// /hard-goal·첫 메시지 파이프라인이 곧바로 성립하게 한다. 템플릿 원본은 코드에
 // 인라인하지 않고 에이전트 설치 폴더의 templates/docs/ 아래 실제 파일로 두어
 // (스킬 본문을 파일로 주입하는 기존 관례와 동일) 콘텐츠와 코드를 분리한다.
 // 이 원본은 buildTaskTrackingInstructions가 강제하는 마커(## Backlog/
@@ -190,6 +195,325 @@ function buildDirectCodingPrompt(objective: string, root: string): {
   ].join("\n");
 
   return { checklist, prompt };
+}
+
+function sectionBody(markdown: string, heading: string): string {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(
+    `## ${escaped}\\n([\\s\\S]*?)(?=\\n## [^\\n]+\\n|$)`,
+    "i",
+  );
+  return markdown.match(pattern)?.[1]?.trim() ?? "";
+}
+
+function extractTaskIdsFromSection(markdown: string, heading: string): string[] {
+  const body = sectionBody(markdown, heading);
+  return Array.from(body.matchAll(/-\s*(T-\d{3})\b/g)).map((match) => match[1]);
+}
+
+function parseTaskBlocksFromFile(filePath: string): TaskBlock[] {
+  if (!fs.existsSync(filePath)) return [];
+  const text = fs.readFileSync(filePath, "utf8");
+  const headerPattern =
+    /^###\s+(T-\d{3})\s+(?:\[([^\]]+)\]\s+)?(.+?)\s*$/gm;
+  const headers = Array.from(text.matchAll(headerPattern));
+  const tasks: TaskBlock[] = [];
+
+  for (let index = 0; index < headers.length; index += 1) {
+    const match = headers[index];
+    const start = match.index ?? 0;
+    const end = headers[index + 1]?.index ?? text.length;
+    const raw = text.slice(start, end).trim();
+    const statusMatch = raw.match(/\*\*Status:\*\*\s*(backlog|in-progress|done)\b/i);
+    tasks.push({
+      id: match[1],
+      label: match[2] ?? null,
+      title: match[3].trim(),
+      status: (statusMatch?.[1]?.toLowerCase() as TaskBlock["status"]) ?? null,
+      parentIds: extractTaskIdsFromSection(raw, "Parent"),
+      blockedByIds: extractTaskIdsFromSection(raw, "Blocked by"),
+      raw,
+      sourcePath: filePath,
+    });
+  }
+
+  return tasks;
+}
+
+function loadCandidateTasks(root: string): TaskBlock[] {
+  const docs = projectDocPaths(root);
+  return [
+    ...parseTaskBlocksFromFile(docs.tasksBacklog),
+    ...parseTaskBlocksFromFile(docs.tasksCurrent),
+  ];
+}
+
+function extractParallelTaskIds(text: string): string[] {
+  const start = text.indexOf(PARALLEL_TASKS_START);
+  const end = text.indexOf(PARALLEL_TASKS_END, start + PARALLEL_TASKS_START.length);
+  if (start < 0 || end < 0) return [];
+  return Array.from(
+    text
+      .slice(start + PARALLEL_TASKS_START.length, end)
+      .matchAll(/\bT-\d{3}\b/g),
+  ).map((match) => match[0]);
+}
+
+function chooseParallelCodingTasks(root: string, planningResponse: string): TaskBlock[] {
+  const allTasks = loadCandidateTasks(root);
+  const preferredIds = new Set(extractParallelTaskIds(planningResponse));
+  if (preferredIds.size === 0) return [];
+  const preferredTasks = allTasks.filter((task) => preferredIds.has(task.id));
+
+  const eligible = preferredTasks.filter(
+    (task) =>
+      task.label === "ready-for-agent" &&
+      task.status !== "done" &&
+      task.blockedByIds.length === 0,
+  );
+  if (eligible.length < 2) return [];
+
+  const grouped = new Map<string, TaskBlock[]>();
+  for (const task of eligible) {
+    const parentKey = task.parentIds[0] ?? `__self__:${task.id}`;
+    const bucket = grouped.get(parentKey) ?? [];
+    bucket.push(task);
+    grouped.set(parentKey, bucket);
+  }
+
+  const bestGroup = Array.from(grouped.values())
+    .filter((tasks) => tasks.length >= 2)
+    .sort((left, right) => right.length - left.length)[0];
+  if (!bestGroup) return [];
+
+  return bestGroup.slice(0, MAX_PARALLEL_CODING_TASKS);
+}
+
+function buildParallelTaskCodingPrompt(
+  task: TaskBlock,
+  checklist: string,
+  root: string,
+): string {
+  return [
+    "당신은 병렬 코딩 단계의 서브태스크 전용 구현 에이전트다.",
+    "아래 T-### 블록 하나만 책임지고 구현하라. 다른 서브태스크까지 확장하지 말라.",
+    "다른 병렬 에이전트와 충돌을 줄이기 위해 docs/tasks/* 파일, CONTEXT.md, ADR 문서는 수정하지 말라.",
+    "현재 작업 디렉터리는 임시 분기용 스냅샷이다. 이 스냅샷 안에서 필요한 코드만 수정하라.",
+    `실제 수정 대상 루트: ${root}`,
+    "가능하면 이 서브태스크와 직접 관련된 파일만 건드리고, 완료 후 변경 내용과 실행한 검증만 간단히 보고하라.",
+    "",
+    buildImplementSkillGuidance(),
+    "",
+    "<parallel-task>",
+    `담당 태스크: ${task.id} ${task.title}`,
+    task.raw,
+    "</parallel-task>",
+    "",
+    "전체 목표 체크리스트(회귀 방지용):",
+    checklist,
+  ].join("\n");
+}
+
+function buildParallelIntegrationPrompt(
+  checklist: string,
+  taskRuns: ParallelTaskRun[],
+  root: string,
+): string {
+  const summaries = taskRuns
+    .map(
+      (run, index) =>
+        `${index + 1}. ${run.task.id} ${run.task.title}\n변경 파일 수: ${run.changes.length}\n요약:\n${run.output}`,
+    )
+    .join("\n\n");
+
+  return [
+    "병렬 서브태스크 코딩 결과가 현재 워크트리에 이미 병합되어 있다.",
+    "이제 남은 일만 처리하라: 교차 서브태스크 seam 정리, 누락된 최소 통합 수정, 그리고 태스크 추적 문서 갱신.",
+    "이미 병합된 큰 구현을 다시 처음부터 뒤엎지 말고, 현재 워크트리를 직접 읽어 최소 보완만 하라.",
+    "",
+    buildImplementSkillGuidance(),
+    "",
+    buildTaskTrackingInstructions(root),
+    "",
+    "병렬 서브태스크 요약:",
+    summaries,
+    "",
+    "전체 목표 체크리스트:",
+    checklist,
+  ].join("\n");
+}
+
+function shouldSkipSnapshotPath(relativePath: string): boolean {
+  const top = relativePath.split(path.sep)[0] ?? relativePath;
+  return [
+    ".git",
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    ".turbo",
+    ".dart_tool",
+    "Pods",
+    "DerivedData",
+    ".gradle",
+    "coverage",
+  ].includes(top);
+}
+
+function copyWorkspaceSnapshot(sourceRoot: string, snapshotRoot: string): void {
+  fs.mkdirSync(snapshotRoot, { recursive: true });
+  fs.cpSync(sourceRoot, snapshotRoot, {
+    recursive: true,
+    filter: (source) => {
+      const relativePath = path.relative(sourceRoot, source);
+      if (!relativePath) return true;
+      return !shouldSkipSnapshotPath(relativePath);
+    },
+  });
+}
+
+function hashFile(filePath: string): string {
+  const hash = createHash("sha256");
+  hash.update(fs.readFileSync(filePath));
+  return hash.digest("hex");
+}
+
+function listWorkspaceFiles(root: string): string[] {
+  const results: string[] = [];
+
+  function walk(currentDir: string): void {
+    for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+      const absolutePath = path.join(currentDir, entry.name);
+      const relativePath = path.relative(root, absolutePath);
+      if (shouldSkipSnapshotPath(relativePath)) continue;
+      if (entry.isDirectory()) {
+        walk(absolutePath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      results.push(relativePath);
+    }
+  }
+
+  walk(root);
+  return results.sort();
+}
+
+function captureWorkspaceHashes(root: string): Map<string, string> {
+  const hashes = new Map<string, string>();
+  for (const relativePath of listWorkspaceFiles(root)) {
+    hashes.set(relativePath, hashFile(path.join(root, relativePath)));
+  }
+  return hashes;
+}
+
+function detectSnapshotChanges(
+  snapshotRoot: string,
+  baseHashes: Map<string, string>,
+): SnapshotChange[] {
+  const snapshotHashes = captureWorkspaceHashes(snapshotRoot);
+  const allPaths = new Set([
+    ...Array.from(baseHashes.keys()),
+    ...Array.from(snapshotHashes.keys()),
+  ]);
+  const changes: SnapshotChange[] = [];
+
+  for (const relativePath of allPaths) {
+    const before = baseHashes.get(relativePath);
+    const after = snapshotHashes.get(relativePath);
+    if (before === after) continue;
+    if (before == null && after != null) {
+      changes.push({ relativePath, kind: "add" });
+      continue;
+    }
+    if (before != null && after == null) {
+      changes.push({ relativePath, kind: "delete" });
+      continue;
+    }
+    changes.push({ relativePath, kind: "modify" });
+  }
+
+  return changes.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+}
+
+function applySnapshotChanges(
+  sourceRoot: string,
+  taskRuns: ParallelTaskRun[],
+  baseHashes: Map<string, string>,
+): { ok: true } | { ok: false; reason: string } {
+  const claimedPaths = new Map<string, string>();
+
+  for (const run of taskRuns) {
+    for (const change of run.changes) {
+      const existing = claimedPaths.get(change.relativePath);
+      if (existing) {
+        return {
+          ok: false,
+          reason: `병렬 태스크가 같은 파일을 수정했습니다: ${change.relativePath} (${existing}, ${run.task.id})`,
+        };
+      }
+      claimedPaths.set(change.relativePath, run.task.id);
+    }
+  }
+
+  for (const run of taskRuns) {
+    for (const change of run.changes) {
+      const destinationPath = path.join(sourceRoot, change.relativePath);
+      const currentHash = fs.existsSync(destinationPath)
+        ? hashFile(destinationPath)
+        : null;
+      const expectedHash = baseHashes.get(change.relativePath) ?? null;
+      if (currentHash !== expectedHash) {
+        return {
+          ok: false,
+          reason: `병합 직전 원본 파일이 바뀌어 자동 병합을 중단합니다: ${change.relativePath}`,
+        };
+      }
+    }
+  }
+
+  const backups: FileBackup[] = [];
+  for (const run of taskRuns) {
+    for (const change of run.changes) {
+      const destinationPath = path.join(sourceRoot, change.relativePath);
+      backups.push({
+        relativePath: change.relativePath,
+        content: fs.existsSync(destinationPath)
+          ? fs.readFileSync(destinationPath)
+          : null,
+      });
+    }
+  }
+
+  try {
+    for (const run of taskRuns) {
+      for (const change of run.changes) {
+        const destinationPath = path.join(sourceRoot, change.relativePath);
+        const sourcePath = path.join(run.snapshotDir, change.relativePath);
+        if (change.kind === "delete") {
+          if (fs.existsSync(destinationPath)) fs.rmSync(destinationPath);
+          continue;
+        }
+
+        fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+        fs.copyFileSync(sourcePath, destinationPath);
+      }
+    }
+  } catch (error) {
+    for (const backup of backups.reverse()) {
+      const destinationPath = path.join(sourceRoot, backup.relativePath);
+      if (backup.content == null) {
+        if (fs.existsSync(destinationPath)) fs.rmSync(destinationPath);
+        continue;
+      }
+      fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+      fs.writeFileSync(destinationPath, backup.content);
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, reason: `병합 중 롤백이 발생했습니다: ${message}` };
+  }
+
+  return { ok: true };
 }
 
 function isLikelyQuickTask(objective: string): boolean {
@@ -414,6 +738,45 @@ type ReviewResult = {
   failedItems: FailedItem[];
 };
 
+type FailedCommand = {
+  command: string;
+  reason: string;
+  evidence: string;
+};
+
+type TestResult = {
+  overall: "PASS" | "FAIL";
+  failedCommands: FailedCommand[];
+};
+
+type TaskBlock = {
+  id: string;
+  label: string | null;
+  title: string;
+  status: "backlog" | "in-progress" | "done" | null;
+  parentIds: string[];
+  blockedByIds: string[];
+  raw: string;
+  sourcePath: string;
+};
+
+type SnapshotChange = {
+  relativePath: string;
+  kind: "add" | "modify" | "delete";
+};
+
+type ParallelTaskRun = {
+  task: TaskBlock;
+  snapshotDir: string;
+  output: string;
+  changes: SnapshotChange[];
+};
+
+type FileBackup = {
+  relativePath: string;
+  content: Buffer | null;
+};
+
 type ReviewStage =
   | "idle"
   | "awaiting-execution"
@@ -433,9 +796,11 @@ type GateState = {
   reviewStage: ReviewStage;
   checklist: string | null;
   improvementRound: number;
-  // /goal로 시작한 작업만 체크리스트 생성 직후 구현까지 자동 진행한다.
+  // /hard-goal, /easy-goal로 시작한 작업만 체크리스트 생성 직후 구현까지 자동 진행한다.
   // 일반 대화는 기존처럼 사용자의 구현 승인을 기다린다.
   autoMode: boolean;
+  // true면 테스트 뒤 독립 검수/개선 루프까지 이어가고, false면 테스트까지만 자동 실행한다.
+  autoReview: boolean;
   // 비동기 코드 실행과 검수 결과가 다른 목표의 상태를 덮어쓰지 않도록 각
   // 워크플로에 고유 ID를 부여한다. processingWorkflowId는 중복 agent_end 진입을 막는다.
   workflowId: string | null;
@@ -735,6 +1100,31 @@ function withJsonMode(args: string[]): string[] {
 // 보이는 채 방치되면 그대로 시스템 부하가 된다. 부모 종료·새 세션 시작·clear
 // 시점에 여기 남은 자식을 반드시 회수한다.
 const activeChildren = new Set<ChildProcess>();
+const activeChildStatuses = new Map<string, string>();
+
+function renderActiveChildStatuses(): string | undefined {
+  if (activeChildStatuses.size === 0) return undefined;
+  return Array.from(activeChildStatuses.entries())
+    .map(([label, status]) => `${label}: ${status}`)
+    .join(" | ");
+}
+
+function setLoopAgentChildStatus(
+  ui: Pick<ExtensionContext["ui"], "setStatus">,
+  label: string,
+  status: string,
+): void {
+  activeChildStatuses.set(label, status);
+  ui.setStatus("loop-agent", renderActiveChildStatuses());
+}
+
+function clearLoopAgentChildStatus(
+  ui: Pick<ExtensionContext["ui"], "setStatus">,
+  label: string,
+): void {
+  activeChildStatuses.delete(label);
+  ui.setStatus("loop-agent", renderActiveChildStatuses());
+}
 
 // 부모 pi가 종료할 때 남은 자식을 고아로 남기지 않는다. 'exit' 핸들러는 동기
 // 코드만 실행되므로 신호 전송까지만 한다(SIGKILL 에스컬레이션은 불가능하지만,
@@ -751,6 +1141,7 @@ function killActiveChildren(): number {
     killed += 1;
   }
   activeChildren.clear();
+  activeChildStatuses.clear();
   return killed;
 }
 
@@ -766,7 +1157,7 @@ async function runPiCommandWithProgress(
   // idle일 때만 진행 메시지를 보내고, 스트리밍 중엔 상태줄만 갱신한다.
   isIdle?: () => boolean,
 ): Promise<StreamingRunResult> {
-  ui.setStatus("loop-agent", `${label} 시작`);
+  setLoopAgentChildStatus(ui, label, "시작");
 
   return await new Promise<StreamingRunResult>((resolve, reject) => {
     const child = spawn("pi", withJsonMode(args), {
@@ -795,7 +1186,7 @@ async function runPiCommandWithProgress(
     };
 
     const clearStatus = (): void => {
-      ui.setStatus("loop-agent", undefined);
+      clearLoopAgentChildStatus(ui, label);
     };
 
     const finish = (result: StreamingRunResult): void => {
@@ -821,7 +1212,7 @@ async function runPiCommandWithProgress(
     // 파싱된 이벤트에서 나온 표시용 라인을 로그/상태줄로 흘려보낸다.
     const emit = (parsed: ParsedEventLine): void => {
       if (parsed.status) {
-        ui.setStatus("loop-agent", `${label}: ${parsed.status}`);
+        setLoopAgentChildStatus(ui, label, parsed.status);
       }
       if (!parsed.log) return;
       progressTranscript.push(parsed.log);
@@ -911,7 +1302,7 @@ async function runPiCommandWithProgress(
       timedOut = true;
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 5000).unref();
-      ui.setStatus("loop-agent", `${label} 시간 초과, 종료 중`);
+      setLoopAgentChildStatus(ui, label, "시간 초과, 종료 중");
     }, timeoutMs);
 
     child.stdout.on("data", (chunk: Buffer) => {
@@ -1051,7 +1442,7 @@ function scheduleLengthContinue(
 
 type PersistedWorkflowState = Pick<
   GateState,
-  "reviewStage" | "checklist" | "improvementRound" | "autoMode" | "workflowId"
+  "reviewStage" | "checklist" | "improvementRound" | "autoMode" | "autoReview" | "workflowId"
 >;
 
 const state: GateState = {
@@ -1061,6 +1452,7 @@ const state: GateState = {
   checklist: null,
   improvementRound: 0,
   autoMode: false,
+  autoReview: true,
   workflowId: null,
   processingWorkflowId: null,
   lengthContinueCount: 0,
@@ -1145,7 +1537,7 @@ function resolveTestThinkingLevel(): ThinkingLevel | null {
 }
 
 /**
- * pi.sendUserMessage()는 의도적으로 /skill 명령 확장을 건너뛴다. /goal처럼
+ * pi.sendUserMessage()는 의도적으로 /skill 명령 확장을 건너뛴다. /hard-goal처럼
  * 확장이 직접 시작하는 턴에서는 Pi 코어와 동일한 형태의 skill 블록을 만들어
  * 전달해야 실제 스킬 지침이 모델 문맥에 포함된다.
  */
@@ -1207,6 +1599,8 @@ function buildPlanningPipelinePrompt(
     `워크플로 ID는 ${workflowId}다. 최종 체크리스트 바로 앞에 ${WORKFLOW_MARKER_PREFIX}${workflowId} --> 주석을 정확히 출력하라.`,
     "아직 물을 질문이 남았으면 이번 턴은 질문으로 끝내라(체크리스트를 출력하지 말라). 인터뷰가 완전히 끝난 뒤에만 구현 계획과 목표 체크리스트를 작성하라.",
     "체크리스트를 출력하는 마지막 턴에서는 구현 승인 여부를 다시 묻지 말라. 확장이 코드 에이전트를 자동 실행한다.",
+    `to-issues가 만든 T-### 중 병렬 코딩 후보가 있으면 ${PARALLEL_TASKS_START}와 ${PARALLEL_TASKS_END} 사이에`,
+    "서로 독립적이고 ready-for-agent이며 바로 시작 가능한 태스크 ID만 한 줄에 하나씩 출력하라. 없으면 이 블록은 생략하라.",
     "</loop-agent-auto>",
   ].join("\n");
 }
@@ -1223,6 +1617,7 @@ function persistWorkflowState(pi: ExtensionAPI, reason: string): void {
     checklist: state.checklist,
     improvementRound: state.improvementRound,
     autoMode: state.autoMode,
+    autoReview: state.autoReview,
     workflowId: state.workflowId,
   };
   pi.appendEntry("loop-agent-state", { reason, snapshot });
@@ -1249,6 +1644,7 @@ function restoreWorkflowState(ctx: ExtensionContext): boolean {
       ? Number(snapshot.improvementRound)
       : 0;
     state.autoMode = snapshot.autoMode === true;
+    state.autoReview = snapshot.autoReview !== false;
     state.workflowId =
       typeof snapshot.workflowId === "string" ? snapshot.workflowId : null;
     state.processingWorkflowId = null;
@@ -1416,6 +1812,35 @@ function extractReviewResult(report: string): ReviewResult {
   return { overall: parsed.overall, failedItems };
 }
 
+function extractTestResult(report: string): TestResult {
+  const start = report.indexOf(TEST_RESULT_START);
+  const end = report.indexOf(TEST_RESULT_END, start + TEST_RESULT_START.length);
+  if (start < 0 || end < 0) {
+    throw new Error("테스트 보고서에 구조화된 판정 블록이 없습니다.");
+  }
+
+  const parsed = JSON.parse(
+    report.slice(start + TEST_RESULT_START.length, end).trim(),
+  ) as Partial<TestResult>;
+  if (parsed.overall !== "PASS" && parsed.overall !== "FAIL") {
+    throw new Error("테스트 보고서의 overall 판정이 올바르지 않습니다.");
+  }
+
+  const failedCommands = Array.isArray(parsed.failedCommands)
+    ? parsed.failedCommands.filter(
+        (item): item is FailedCommand =>
+          typeof item?.command === "string" &&
+          typeof item?.reason === "string" &&
+          typeof item?.evidence === "string",
+      )
+    : [];
+
+  if (parsed.overall === "FAIL" && failedCommands.length === 0) {
+    throw new Error("FAIL 판정에 실패한 검증 명령이 포함되지 않았습니다.");
+  }
+  return { overall: parsed.overall, failedCommands };
+}
+
 /**
  * 구현 에이전트와 문맥이 분리된 Pi 프로세스에 검수를 맡긴다.
  * --no-extensions는 이 확장이 자식 프로세스에서도 다시 실행되는 재귀를 막고,
@@ -1528,6 +1953,147 @@ async function runValidatedReview(
     : new Error("검수 판정 형식을 확인할 수 없습니다.");
 }
 
+async function runValidatedTestAgent(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  checklist: string,
+): Promise<{ report: string; result: TestResult }> {
+  const report = await runTestAgent(pi, ctx, checklist);
+  return { report, result: extractTestResult(report) };
+}
+
+async function runParallelCodingPhase(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  checklist: string,
+  planningResponse: string,
+): Promise<string | null> {
+  const tasks = chooseParallelCodingTasks(ctx.cwd, planningResponse);
+  if (tasks.length < 2) return null;
+
+  ctx.ui.notify(
+    `loop-agent: 독립 서브태스크 ${tasks.length}개를 병렬 코딩으로 fan-out 합니다.`,
+    "info",
+  );
+
+  const baseHashes = captureWorkspaceHashes(ctx.cwd);
+  const snapshotDirs: string[] = [];
+  try {
+    const taskPromises = tasks.map(async (task): Promise<ParallelTaskRun> => {
+      const snapshotDir = path.join(
+        os.tmpdir(),
+        `loop-agent-${Date.now()}-${task.id}-${randomUUID()}`,
+      );
+      snapshotDirs.push(snapshotDir);
+      copyWorkspaceSnapshot(ctx.cwd, snapshotDir);
+      const prompt = buildParallelTaskCodingPrompt(task, checklist, snapshotDir);
+      const taskCtx: ExtensionContext = { ...ctx, cwd: snapshotDir };
+      const output = await runCodingAgent(pi, taskCtx, prompt);
+      const changes = detectSnapshotChanges(snapshotDir, baseHashes);
+      return { task, snapshotDir, output, changes };
+    });
+
+    const settledRuns = await Promise.allSettled(taskPromises);
+    const failures = settledRuns.filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    if (failures.length > 0) {
+      const first = failures[0]?.reason;
+      const message = first instanceof Error ? first.message : String(first);
+      ctx.ui.notify(
+        `loop-agent: 병렬 서브태스크 중 일부가 실패해 단일 코딩 경로로 fallback 합니다 (${message}).`,
+        "warning",
+      );
+      return null;
+    }
+    const taskRuns = settledRuns
+      .filter(
+        (result): result is PromiseFulfilledResult<ParallelTaskRun> =>
+          result.status === "fulfilled",
+      )
+      .map((result) => result.value);
+    const mergeResult = applySnapshotChanges(ctx.cwd, taskRuns, baseHashes);
+    if (!mergeResult.ok) {
+      ctx.ui.notify(
+        `loop-agent: 병렬 코딩 결과를 자동 병합할 수 없어 단일 코딩 경로로 fallback 합니다 (${mergeResult.reason}).`,
+        "warning",
+      );
+      return null;
+    }
+
+    const integrationPrompt = buildParallelIntegrationPrompt(
+      checklist,
+      taskRuns,
+      ctx.cwd,
+    );
+    const integrationOutput = await runCodingAgent(pi, ctx, integrationPrompt);
+    const combined = taskRuns
+      .map(
+        (run, index) =>
+          `## 병렬 서브태스크 ${index + 1}: ${run.task.id} ${run.task.title}\n\n${run.output}`,
+      )
+      .concat(`## 병렬 병합 후 통합 정리\n\n${integrationOutput}`)
+      .join("\n\n");
+    return combined;
+  } finally {
+    for (const snapshotDir of snapshotDirs) {
+      fs.rmSync(snapshotDir, { recursive: true, force: true });
+    }
+  }
+}
+
+async function runCodingPhase(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  checklist: string,
+  prompt: string,
+): Promise<string> {
+  const parallelOutput =
+    state.improvementRound === 0
+      ? await runParallelCodingPhase(pi, ctx, checklist, prompt)
+      : null;
+  if (parallelOutput) return parallelOutput;
+  return runCodingAgent(pi, ctx, prompt);
+}
+
+function mergeVerificationResults(
+  review: ReviewResult,
+  testResult: TestResult | null,
+): ReviewResult {
+  if (!testResult || testResult.overall === "PASS") return review;
+  return {
+    overall: "FAIL",
+    failedItems: [
+      ...review.failedItems,
+      ...testResult.failedCommands.map((item) => ({
+        item: `[테스트] ${item.command}`,
+        reason: item.reason,
+        evidence: item.evidence,
+      })),
+    ],
+  };
+}
+
+function buildMergedReviewReport(
+  reviewReport: string,
+  testResult: TestResult | null,
+): string {
+  if (!testResult || testResult.overall === "PASS") return reviewReport;
+  const failures = testResult.failedCommands
+    .map(
+      (item, index) =>
+        `${index + 1}. 명령: ${item.command}\n   실패 이유: ${item.reason}\n   근거: ${item.evidence}`,
+    )
+    .join("\n");
+  return [
+    reviewReport,
+    "",
+    "## 병렬 테스트 판정 보강",
+    "아래 검증 명령 실패를 최종 미통과 근거에 추가합니다.",
+    failures,
+  ].join("\n");
+}
+
 function isCurrentWorkflow(workflowId: string): boolean {
   return state.workflowId === workflowId;
 }
@@ -1591,6 +2157,12 @@ async function runTestAgent(
     "실행 명령, 실제 시도/통과 개수, 실패한 테스트의 이름 및 실패 이유를 있는 그대로 상세하게 보고하라.",
     "테스트를 직접 수정하거나 새 테스트를 작성하지 말고, 실패를 통과로 위장하지 말라.",
     "보고서는 한국어로 작성하라.",
+    'PASS JSON 형식: {"overall":"PASS","failedCommands":[]}',
+    'FAIL JSON 형식: {"overall":"FAIL","failedCommands":[{"command":"실패한 명령","reason":"실패 이유","evidence":"실패 로그/테스트명"}]}',
+    `보고서 마지막 줄들에서 먼저 ${TEST_RESULT_START}를 출력하라.`,
+    "그 다음 줄에 실제 판정 JSON 객체 하나만 출력하라.",
+    `마지막으로 ${TEST_RESULT_END}를 출력하라.`,
+    "두 경계 사이에는 설명, 접두어, 마크다운 코드 펜스를 넣지 말라.",
     "",
     "목표 결과 체크리스트(참조용, 직접 판정하지 말 것):",
     checklist,
@@ -1689,7 +2261,12 @@ async function runExecutionReviewLoop(
         state.reviewStage = "awaiting-execution";
         persistWorkflowState(pi, "coding-started");
         ctx.ui.notify("loop-agent: 코드 에이전트를 실행합니다.", "info");
-        const codingOutput = await runCodingAgent(pi, ctx, codingPrompt);
+        const codingOutput = await runCodingPhase(
+          pi,
+          ctx,
+          state.checklist,
+          codingPrompt,
+        );
         if (!isCurrentWorkflow(workflowId)) return;
 
         pi.appendEntry("loop-agent-coding-result", {
@@ -1709,12 +2286,35 @@ async function runExecutionReviewLoop(
         persistWorkflowState(pi, "coding-completed");
       }
 
-      state.reviewStage = "testing";
+      state.reviewStage = state.autoReview ? "reviewing" : "testing";
       persistWorkflowState(pi, "testing-started");
-      ctx.ui.notify("loop-agent: 테스트 전용 에이전트를 실행합니다.", "info");
+      ctx.ui.notify(
+        state.autoReview
+          ? "loop-agent: 테스트 전용 에이전트와 독립 검수 에이전트를 병렬 실행합니다."
+          : "loop-agent: 테스트 전용 에이전트를 실행합니다.",
+        "info",
+      );
       let testReport: string | null = null;
+      let testResult: TestResult | null = null;
+      const testPromise = runValidatedTestAgent(pi, ctx, state.checklist);
+
+      let reviewPromise:
+        | Promise<
+            | { ok: true; value: { report: string; result: ReviewResult } }
+            | { ok: false; error: unknown }
+          >
+        | null = null;
+      if (state.autoReview) {
+        persistWorkflowState(pi, "review-started");
+        reviewPromise = runValidatedReview(pi, ctx, state.checklist, null)
+          .then((value) => ({ ok: true as const, value }))
+          .catch((error: unknown) => ({ ok: false as const, error }));
+      }
+
       try {
-        testReport = await runTestAgent(pi, ctx, state.checklist);
+        const testRun = await testPromise;
+        testReport = testRun.report;
+        testResult = testRun.result;
         if (!isCurrentWorkflow(workflowId)) return;
         pi.appendEntry("loop-agent-test-result", {
           workflowId,
@@ -1733,26 +2333,56 @@ async function runExecutionReviewLoop(
       } catch (error) {
         if (!isCurrentWorkflow(workflowId)) return;
         const message = error instanceof Error ? error.message : String(error);
+        testResult = {
+          overall: "FAIL",
+          failedCommands: [
+            {
+              command: "테스트 에이전트 실행",
+              reason: message,
+              evidence:
+                "테스트 에이전트가 성공적으로 완료되거나 구조화된 결과를 반환하지 못했습니다.",
+            },
+          ],
+        };
         ctx.ui.notify(
-          `loop-agent: 테스트 에이전트 실행을 건너뜁니다 (${message}). 기존 근거만으로 검수를 진행합니다.`,
+          `loop-agent: 테스트 에이전트가 실패했습니다 (${message}). 이 라운드는 테스트 미통과로 처리합니다.`,
           "warning",
         );
       }
       persistWorkflowState(pi, "testing-completed");
 
-      state.reviewStage = "reviewing";
-      persistWorkflowState(pi, "review-started");
-      ctx.ui.notify(
-        "loop-agent: 읽기 전용 독립 에이전트가 체크리스트를 검수합니다.",
-        "info",
-      );
-      const { report, result } = await runValidatedReview(
-        pi,
-        ctx,
-        state.checklist,
-        testReport,
-      );
+      if (!state.autoReview) {
+        if (!testResult || testResult.overall !== "PASS") {
+          state.reviewStage = "failed";
+          state.autoMode = false;
+          state.autoReview = true;
+          state.workflowId = null;
+          persistWorkflowState(pi, "testing-failed");
+          ctx.ui.notify(
+            "loop-agent: 테스트를 통과하지 못해 easy-goal 워크플로를 완료로 처리하지 않습니다.",
+            "error",
+          );
+          return;
+        }
+        state.reviewStage = "reviewed";
+        state.autoMode = false;
+        state.autoReview = true;
+        state.workflowId = null;
+        persistWorkflowState(pi, "completed-without-review");
+        ctx.ui.notify(
+          "loop-agent: 테스트 단계까지 완료했고 독립 검수 자동 반복은 생략합니다.",
+          "info",
+        );
+        return;
+      }
+
+      const reviewRun = await reviewPromise!;
+      if (!reviewRun.ok) throw reviewRun.error;
+      const { report: rawReviewReport, result: rawReviewResult } =
+        reviewRun.value;
       if (!isCurrentWorkflow(workflowId)) return;
+      const report = buildMergedReviewReport(rawReviewReport, testResult);
+      const result = mergeVerificationResults(rawReviewResult, testResult);
       pi.appendEntry("loop-agent-review", {
         workflowId,
         checklist: state.checklist,
@@ -1773,6 +2403,7 @@ async function runExecutionReviewLoop(
       if (result.overall === "PASS") {
         state.reviewStage = "reviewed";
         state.autoMode = false;
+        state.autoReview = true;
         state.workflowId = null;
         persistWorkflowState(pi, "completed");
         ctx.ui.notify(
@@ -1785,6 +2416,7 @@ async function runExecutionReviewLoop(
       if (state.improvementRound >= config.maxImprovementRounds) {
         state.reviewStage = "failed";
         state.autoMode = false;
+        state.autoReview = true;
         state.workflowId = null;
         persistWorkflowState(pi, "max-rounds-reached");
         ctx.ui.notify(
@@ -1811,6 +2443,7 @@ async function runExecutionReviewLoop(
     if (!isCurrentWorkflow(workflowId)) return;
     state.reviewStage = "failed";
     state.autoMode = false;
+    state.autoReview = true;
     state.workflowId = null;
     persistWorkflowState(pi, "execution-failed");
     const message = error instanceof Error ? error.message : String(error);
@@ -1848,6 +2481,7 @@ function renderGateStatus(): string {
     `- checklistReady: ${state.checklist !== null}`,
     `- improvementRound: ${state.improvementRound}/${config.maxImprovementRounds}`,
     `- autoMode: ${state.autoMode}`,
+    `- autoReview: ${state.autoReview}`,
     `- workflowId: ${state.workflowId ?? "none"}`,
     `- processingWorkflowId: ${state.processingWorkflowId ?? "none"}`,
     `- planningModel: ${config.planningModel ?? "current"}`,
@@ -1881,6 +2515,7 @@ function applyGateCommand(command: string, pi: ExtensionAPI): boolean {
       state.checklist = null;
       state.improvementRound = 0;
       state.autoMode = false;
+      state.autoReview = true;
       state.workflowId = null;
       // 상태만 리셋하면 이미 spawn된 자식 에이전트는 보이지 않는 채 계속
       // 실행되므로(부하), clear는 자식 프로세스까지 함께 회수해야 한다.
@@ -1917,6 +2552,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       state.checklist = null;
       state.improvementRound = 0;
       state.autoMode = false;
+      state.autoReview = true;
       state.workflowId = null;
       state.processingWorkflowId = null;
       await selectModel(
@@ -1934,6 +2570,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
         state.checklist &&
         state.workflowId &&
         (state.reviewStage === "awaiting-execution" ||
+          state.reviewStage === "testing" ||
           state.reviewStage === "reviewing")
       ) {
         // 중단 지점에서 코드를 무조건 재실행하면 이미 반영된 변경을 중복 적용할
@@ -1966,6 +2603,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       state.checklist &&
       state.workflowId &&
       (state.reviewStage === "awaiting-execution" ||
+        state.reviewStage === "testing" ||
         state.reviewStage === "reviewing")
     ) {
       ctx.ui.notify(
@@ -1976,16 +2614,16 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     }
   });
 
-  // /goal 명령과 첫 세션 메시지(input 핸들러)가 공유하는 반자동 파이프라인 진입점.
+  // /hard-goal, /easy-goal 명령과 첫 세션 메시지(input 핸들러)가 공유하는 반자동 파이프라인 진입점.
   // 워크플로 상태를 원자적으로 초기화하고 계획 모델을 고른 뒤 계획 프롬프트를
   // 구성해 반환한다. 준비가 실패하면 null을 반환하고 상태를 되돌린다.
   // 실제 입력 주입(sendUserMessage vs input transform)은 호출측이 맡는다.
   async function prepareGoalPipeline(
     ctx: ExtensionContext,
     objective: string,
-    // 명시적 /goal은 전제 누락을 에러로 안내하지만, armed 첫 메시지처럼
+    // 명시적 /hard-goal, /easy-goal은 전제 누락을 에러로 안내하지만, armed 첫 메시지처럼
     // 암묵적으로 파이프라인에 태우는 경우엔 조용히 원본 입력을 통과시킨다.
-    { explicit = true }: { explicit?: boolean } = {},
+    { explicit = true, autoReview = true }: { explicit?: boolean; autoReview?: boolean } = {},
 ): Promise<string | null> {
   if (!ensureWorkflowWorkspace(ctx, explicit)) return null;
 
@@ -2007,6 +2645,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     // 워크플로 상태를 원자적으로 초기화한다.
     state.armed = false;
     state.autoMode = true;
+    state.autoReview = autoReview;
     state.reviewStage = "idle";
     state.checklist = null;
     state.improvementRound = 0;
@@ -2023,6 +2662,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     );
     if (!modelSelected) {
       state.autoMode = false;
+      state.autoReview = true;
       state.workflowId = null;
       persistWorkflowState(pi, "planning-model-failed");
       return null;
@@ -2036,6 +2676,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       return buildPlanningPipelinePrompt(objective, workflowId, ctx.cwd);
     } catch (error) {
       state.autoMode = false;
+      state.autoReview = true;
       state.workflowId = null;
       persistWorkflowState(pi, "goal-start-failed");
       const message = error instanceof Error ? error.message : String(error);
@@ -2052,6 +2693,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     ctx: ExtensionContext,
     objective: string,
     explicit: boolean,
+    autoReview = true,
   ): Promise<boolean> {
     if (!ensureWorkflowWorkspace(ctx, explicit)) return false;
 
@@ -2060,6 +2702,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
 
     state.armed = false;
     state.autoMode = true;
+    state.autoReview = autoReview;
     state.reviewStage = "awaiting-execution";
     state.checklist = checklist;
     state.improvementRound = 0;
@@ -2075,6 +2718,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     );
     if (!modelSelected) {
       state.autoMode = false;
+      state.autoReview = true;
       state.reviewStage = "idle";
       state.checklist = null;
       state.workflowId = null;
@@ -2090,14 +2734,57 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     return true;
   }
 
-  // /goal 명령용: 개별 메시지로 계획 프롬프트를 주입한다.
+  // /hard-goal 명령용: 개별 메시지로 계획 프롬프트를 주입한다.
   async function startGoalWorkflow(
     piApi: ExtensionAPI,
     ctx: ExtensionContext,
     objective: string,
+    autoReview = true,
   ): Promise<void> {
-    const prompt = await prepareGoalPipeline(ctx, objective);
+    const prompt = await prepareGoalPipeline(ctx, objective, { autoReview });
     if (prompt) piApi.sendUserMessage(prompt);
+  }
+
+  // 첫 메시지 자동 진입과 /easy-goal 명령이 같은 모드 판별(quick/direct/plan)을
+  // 공유하도록 묶는다. 명시적 명령은 sendUserMessage로 새 턴을 시작하고, 첫
+  // 메시지 입력 핸들러는 같은 판별 결과를 이용하되 prompt 텍스트를 반환해
+  // runner 계약(result.text / result.handled)에 맞게 원문을 치환한다.
+  async function resolveEasyGoalWorkflow(
+    piApi: ExtensionAPI,
+    ctx: ExtensionContext,
+    rawObjective: string,
+    explicit: boolean,
+  ): Promise<{ handled: boolean; prompt?: string }> {
+    const mode = parseGoalMode(rawObjective);
+    const objective = mode?.objective ?? rawObjective;
+
+    if (mode?.mode === "direct") {
+      return { handled: await startQuickWorkflow(piApi, ctx, objective, true, false) };
+    }
+
+    if (!mode && isLikelyQuickTask(objective)) {
+      const started = await startQuickWorkflow(piApi, ctx, objective, false, false);
+      if (started) return { handled: true };
+    }
+
+    const prompt = await prepareGoalPipeline(ctx, objective, {
+      explicit,
+      autoReview: false,
+    });
+    if (!prompt) return { handled: false };
+    return { handled: true, prompt };
+  }
+
+  async function startEasyGoalWorkflow(
+    piApi: ExtensionAPI,
+    ctx: ExtensionContext,
+    rawObjective: string,
+    explicit: boolean,
+  ): Promise<boolean> {
+    const result = await resolveEasyGoalWorkflow(piApi, ctx, rawObjective, explicit);
+    if (!result.prompt) return result.handled;
+    piApi.sendUserMessage(result.prompt);
+    return true;
   }
 
   pi.on("input", async (event, ctx) => {
@@ -2126,21 +2813,16 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       return { action: "continue" };
     }
 
-    if (isLikelyQuickTask(text)) {
-      const started = await startQuickWorkflow(pi, ctx, text, false);
-      if (started) {
-        return { action: "handled" };
-      }
-    }
-
-    // 작은 단일 작업은 계획 없이 바로 코드 에이전트로 보낼 수 있다.
-    // 그렇지 않으면 /goal과 같은 반자동 파이프라인으로 흘린다.
-    // 준비 실패(바쁘/이미 진행 중/전제 파일 누락) 시에는 원본을 그대로 통과시킨다.
-    const prompt = await prepareGoalPipeline(ctx, text, { explicit: false });
-    if (!prompt) {
+    // 첫 메시지도 /easy-goal과 같은 스타터를 공유한다. 준비 실패(바쁨/이미 진행
+    // 중/전제 파일 누락) 시에만 원본을 그대로 통과시킨다.
+    const result = await resolveEasyGoalWorkflow(pi, ctx, text, false);
+    if (!result.handled) {
       return { action: "continue" };
     }
-    return { action: "transform", text: prompt };
+    if (result.prompt) {
+      return { action: "transform", text: result.prompt };
+    }
+    return { action: "handled" };
   });
 
   pi.on("agent_end", async (event, ctx) => {
@@ -2215,7 +2897,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       );
 
       if (state.autoMode) {
-        // /goal 작업은 사용자 승인을 다시 기다리지 않는다. 확장이 별도 코드
+        // /hard-goal, /easy-goal 작업은 사용자 승인을 다시 기다리지 않는다. 확장이 별도 코드
         // 프로세스의 종료 코드를 직접 기다리므로 실행 실패도 상태에 반영된다.
         const codingPrompt = [
           "자동 실행 모드입니다. 아래 확정 명세와 구현 계획을 즉시 실행하세요.",
@@ -2253,13 +2935,13 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     startExecutionReviewLoop(pi, ctx, workflowId);
   });
 
-  pi.registerCommand("goal", {
+  pi.registerCommand("hard-goal", {
     description:
-      "Start a semi-automated loop-agent workflow (interview with a human, then auto implement/verify). Usage: /goal [plan|direct] <objective>",
+      "Start a semi-automated loop-agent workflow with independent review repetition. Usage: /hard-goal [plan|direct] <objective>",
     handler: async (args, ctx) => {
       const rawObjective = normalizeArgs(args);
       if (!rawObjective) {
-        ctx.ui.notify("Usage: /goal <objective>", "warning");
+        ctx.ui.notify("Usage: /hard-goal <objective>", "warning");
         return;
       }
 
@@ -2277,6 +2959,20 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       }
 
       await startGoalWorkflow(pi, ctx, objective);
+    },
+  });
+
+  pi.registerCommand("easy-goal", {
+    description:
+      "Start a semi-automated workflow that stops after testing and skips independent review repetition. Usage: /easy-goal [plan|direct] <objective>",
+    handler: async (args, ctx) => {
+      const rawObjective = normalizeArgs(args);
+      if (!rawObjective) {
+        ctx.ui.notify("Usage: /easy-goal <objective>", "warning");
+        return;
+      }
+
+      await startEasyGoalWorkflow(pi, ctx, rawObjective, true);
     },
   });
 

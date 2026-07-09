@@ -30,18 +30,33 @@ Pi 코어를 그대로 두고, 그 위에 전역 에이전트 규칙 · 확장(e
 ────────────────────────────────────────────  ← 자동/수동 경계
         │
 [확장이 자동] 실행 루프 (최대 maxImprovementRounds회 반복)
-  implement → test → review
-        │
-        ▼  체크리스트 항목이 모두 통과할 때까지 실패 항목만 개선
-      완료
+  code
+   │
+   ├─ if to-issues marks parallel candidates and tasks are independent
+   │    code fan-out (snapshot A / snapshot B / ...)
+   │    └─ merge -> integration -> test -> review
+   │
+   └─ otherwise
+        implement -> test -> review
+                 │
+                 ▼  체크리스트 항목이 모두 통과할 때까지 실패 항목만 개선
+               완료
+
+/easy-goal  -> stop after test (fail = not completed)
+/hard-goal  -> continue through review loops
 ```
 
 - **계획 단계는 수동** — `grill-with-docs`가 사람과 질문·답변을 주고받으며 모호함을 없애고,
   ADR·용어집·PRD·이슈를 만든 뒤 `grill-checklist`로 검증 체크리스트를 확정합니다.
 - **경계** — 체크리스트가 기계 판독 경계 안에 생성되면 자동 실행으로 넘어갑니다.
-  일반 대화는 여기서 사용자의 구현 승인을 기다리고, `/goal`로 시작한 작업은 기본적으로 계획 파이프라인을 거치되 짧고 단일한 작업은 직접 실행 경로를 탈 수 있습니다(`/goal direct`로 명시 가능).
-- **실행 루프는 자동** — 코드 에이전트가 `implement → test → review`를 수행하고,
-  독립 검수 에이전트가 체크리스트로 결과를 판정합니다. 실패 항목이 남으면 그 항목만
+  일반 대화의 첫 메시지와 `/easy-goal`은 테스트 단계까지만 자동 실행하고, 테스트가 실패하면 완료로 처리하지 않습니다. `/hard-goal`은 계획 파이프라인 뒤 독립 검수 반복까지 이어집니다. 짧고 단일한 작업은 `direct` 경로를 탈 수 있습니다(`/easy-goal direct`, `/hard-goal direct`).
+- **실행 루프는 자동** — 코드 에이전트가 먼저 구현하고, 그 다음 테스트 에이전트와
+  독립 검수 에이전트가 가능한 구간에서는 병렬로 진행됩니다. 최종 판정은 체크리스트
+  검수와 테스트 결과를 함께 반영합니다. `to-issues`가 명시적으로 병렬 후보 마커를
+  남기고, 그 안에서 독립 `ready-for-agent` 서브태스크가 2개 이상 잡혔을 때만 코딩
+  단계도 임시 스냅샷으로 fan-out 하며, 자동 병합이 안전하지 않으면 즉시 단일 코딩
+  경로로 fallback 합니다.
+  실패 항목이 남으면 그 항목만
   개선하며 `maxImprovementRounds`(기본 3)회까지 반복합니다.
 - **복구 가능** — 루프 상태를 세션 브랜치에 스냅샷으로 남겨 reload/resume 시 같은 지점에서
   이어집니다.
