@@ -26,19 +26,27 @@ export type CommandInvocation = {
 };
 
 export const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-export const MCP_CONFIG_PATH = join(AGENT_DIR, "mcp.json");
+export const MCP_CONFIG_PATHS = [
+  join(AGENT_DIR, ".mcp.json"),
+  join(AGENT_DIR, "mcp.json"),
+] as const;
 export const COMMAND_TIMEOUT_MS = 10_000;
 const CODEGRAPH_DIR_NAME = ".codegraph";
 const CODEGRAPH_DB_NAME = "codegraph.db";
 
-// 실제 등록된 MCP 실행 파일을 그대로 사용하기 위해 mcp.json을 읽는다.
-// 설정 파일이 없거나 JSON이 깨졌다면 빈 설정을 반환해 호출부가 조용히 건너뛰게 한다.
+// 실제 등록된 MCP 실행 파일을 그대로 사용하기 위해 agent home의 MCP 설정을 읽는다.
+// 현재 하네스는 `.mcp.json`을 사용하지만, 예전 구성의 `mcp.json`도 fallback으로 지원한다.
+// 설정 파일이 없거나 JSON이 깨졌다면 다음 후보를 시도하고, 모두 실패하면 빈 설정을 반환한다.
 export function readMcpConfig(): McpConfig {
-  try {
-    return JSON.parse(readFileSync(MCP_CONFIG_PATH, "utf8")) as McpConfig;
-  } catch {
-    return {};
+  for (const configPath of MCP_CONFIG_PATHS) {
+    try {
+      return JSON.parse(readFileSync(configPath, "utf8")) as McpConfig;
+    } catch {
+      // 다음 후보 경로를 시도한다.
+    }
   }
+
+  return {};
 }
 
 // 심볼릭 링크나 상대 경로 차이 때문에 같은 프로젝트를 서로 다른 경로로
