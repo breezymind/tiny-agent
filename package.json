@@ -1,0 +1,20 @@
+{
+  "name": "tiny-agent",
+  "version": "0.1.0",
+  "description": "Pi agent harness with graph-first extensions and reusable skills.",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "bin": {
+    "ai": "./scripts/ai.js"
+  },
+  "pi": {
+    "extensions": [
+      "extensions/auto-index.ts",
+      "extensions/bash-timeout.ts",
+      "extensions/graph-gate.ts",
+      "extensions/loop-agent.ts"
+    ]
+  }
+}
