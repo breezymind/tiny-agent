@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const Database = require("better-sqlite3");
 const { getExtensionPath } = require("@sqliteai/sqlite-vector");
 
 const VECTOR_DIMENSION = 1024;
-const DEFAULT_EMBEDDING_COMMAND = "python3 scripts/issue-embedding.py";
 const ISSUE_ID_PATTERN = /^T-\d{3}$/;
 const VALID_STATUSES = new Set(["backlog", "current", "done"]);
 const VALID_EMBEDDING_STATUSES = new Set(["missing", "ready", "failed"]);
@@ -44,6 +44,28 @@ CREATE INDEX IF NOT EXISTS issues_status_index ON issues(status);
 CREATE INDEX IF NOT EXISTS issues_label_index ON issues(triage_label);
 CREATE INDEX IF NOT EXISTS issues_parent_index ON issues(parent_issue_id);
 CREATE INDEX IF NOT EXISTS issues_embedding_status_index ON issues(embedding_status);
+
+CREATE TABLE IF NOT EXISTS architecture_documents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_path TEXT NOT NULL,
+  section_index INTEGER NOT NULL,
+  heading TEXT NOT NULL,
+  doc_type TEXT NOT NULL CHECK (doc_type IN ('context', 'doc', 'adr')),
+  body TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  embedding BLOB,
+  embedding_status TEXT NOT NULL DEFAULT 'missing'
+    CHECK (embedding_status IN ('missing', 'ready', 'failed')),
+  embedding_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(source_path, section_index)
+);
+
+CREATE INDEX IF NOT EXISTS architecture_documents_source_index
+  ON architecture_documents(source_path);
+CREATE INDEX IF NOT EXISTS architecture_documents_embedding_status_index
+  ON architecture_documents(embedding_status);
 `;
 
 function now() {
@@ -55,6 +77,52 @@ function resolveDbPath(root, configuredPath) {
   return path.isAbsolute(value) ? value : path.resolve(root, value);
 }
 
+function ensureArchitectureDocumentSchema(db) {
+  const table = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'architecture_documents'")
+    .get();
+  if (!table?.sql || table.sql.includes("'doc'")) return;
+
+  emitProgress("아키텍처 문서 테이블을 doc 유형을 지원하도록 업그레이드합니다.");
+  const migrate = db.transaction(() => {
+    db.exec("DROP INDEX IF EXISTS architecture_documents_source_index");
+    db.exec("DROP INDEX IF EXISTS architecture_documents_embedding_status_index");
+    db.exec("ALTER TABLE architecture_documents RENAME TO architecture_documents_legacy");
+    db.exec(`
+      CREATE TABLE architecture_documents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_path TEXT NOT NULL,
+        section_index INTEGER NOT NULL,
+        heading TEXT NOT NULL,
+        doc_type TEXT NOT NULL CHECK (doc_type IN ('context', 'doc', 'adr')),
+        body TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        embedding BLOB,
+        embedding_status TEXT NOT NULL DEFAULT 'missing'
+          CHECK (embedding_status IN ('missing', 'ready', 'failed')),
+        embedding_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(source_path, section_index)
+      )
+    `);
+    db.exec(`
+      INSERT INTO architecture_documents (
+        id, source_path, section_index, heading, doc_type, body, content_hash,
+        embedding, embedding_status, embedding_error, created_at, updated_at
+      )
+      SELECT
+        id, source_path, section_index, heading, doc_type, body, content_hash,
+        embedding, embedding_status, embedding_error, created_at, updated_at
+      FROM architecture_documents_legacy
+    `);
+    db.exec("DROP TABLE architecture_documents_legacy");
+    db.exec("CREATE INDEX architecture_documents_source_index ON architecture_documents(source_path)");
+    db.exec("CREATE INDEX architecture_documents_embedding_status_index ON architecture_documents(embedding_status)");
+  });
+  migrate();
+}
+
 function openStore(dbPath) {
   emitProgress(`SQLite 저장소를 엽니다: ${dbPath}`);
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -64,8 +132,12 @@ function openStore(dbPath) {
   db.pragma("busy_timeout = 5000");
   db.loadExtension(getExtensionPath());
   db.exec(SCHEMA_SQL);
+  ensureArchitectureDocumentSchema(db);
   db.prepare(
     "SELECT vector_init('issues', 'embedding', 'type=FLOAT32,dimension=1024,distance=COSINE')",
+  ).get();
+  db.prepare(
+    "SELECT vector_init('architecture_documents', 'embedding', 'type=FLOAT32,dimension=1024,distance=COSINE')",
   ).get();
   const vectorVersion = db.prepare("SELECT vector_version() AS version").get().version;
   emitProgress(`sqlite-vector ${vectorVersion} 로드 완료 (embedding dimension=${VECTOR_DIMENSION})`);
@@ -90,8 +162,33 @@ function parseCommand(command) {
   return parts;
 }
 
+function defaultEmbeddingPythonCandidates(root, scriptDirectory = __dirname) {
+  const venvBin = process.platform === "win32" ? "Scripts" : "bin";
+  const pythonName = process.platform === "win32" ? "python.exe" : "python";
+  return [
+    process.env.ISSUE_EMBEDDING_PYTHON,
+    path.join(root, ".venv", venvBin, pythonName),
+    path.join(path.dirname(scriptDirectory), ".venv", venvBin, pythonName),
+    "python3",
+  ].filter(Boolean);
+}
+
 function embeddingCommand(root, configuredCommand) {
-  const command = configuredCommand || process.env.ISSUE_EMBEDDING_COMMAND || DEFAULT_EMBEDDING_COMMAND;
+  const configured = configuredCommand || process.env.ISSUE_EMBEDDING_COMMAND;
+  if (!configured) {
+    const scriptPath = fs.existsSync(path.join(root, "scripts", "issue-embedding.py"))
+      ? path.join(root, "scripts", "issue-embedding.py")
+      : path.join(__dirname, "issue-embedding.py");
+    const pythonCandidates = defaultEmbeddingPythonCandidates(root);
+    const executable = pythonCandidates.find((candidate) => candidate !== "python3" && fs.existsSync(candidate)) || "python3";
+    return {
+      executable,
+      args: [scriptPath],
+      cwd: root,
+      command: `${JSON.stringify(executable)} ${JSON.stringify(scriptPath)}`,
+    };
+  }
+  const command = configured;
   const parts = parseCommand(command);
   if (parts.length === 0) throw new Error("임베딩 명령이 비어 있습니다.");
   const [executable, ...args] = parts;
@@ -191,6 +288,238 @@ function bodyForEmbedding(issue) {
     issue.parent_issue_id || "",
     ...(issue.blockedBy || []),
   ].filter(Boolean).join("\n\n");
+}
+
+function architectureDocumentFiles(root) {
+  const files = [];
+  const contextPath = path.join(root, "CONTEXT.md");
+  if (fs.existsSync(contextPath)) files.push(contextPath);
+
+  const docsDirectory = path.join(root, "docs");
+  if (fs.existsSync(docsDirectory)) {
+    for (const entry of fs.readdirSync(docsDirectory, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.endsWith(".md")) {
+        files.push(path.join(docsDirectory, entry.name));
+      }
+    }
+  }
+
+  const adrDirectory = path.join(root, "docs", "adr");
+  if (fs.existsSync(adrDirectory)) {
+    const walk = (directory) => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const filePath = path.join(directory, entry.name);
+        if (entry.isDirectory()) walk(filePath);
+        else if (entry.isFile() && entry.name.endsWith(".md")) files.push(filePath);
+      }
+    };
+    walk(adrDirectory);
+  }
+  return files.sort();
+}
+
+function architectureSections(markdown) {
+  const headings = [...markdown.matchAll(/^(#{1,6})\s+(.+?)\s*$/gm)];
+  if (headings.length === 0) {
+    return [{ heading: "Document", body: markdown.trim() }];
+  }
+  return headings.map((heading, index) => {
+    const start = heading.index || 0;
+    const end = headings[index + 1]?.index || markdown.length;
+    return {
+      heading: heading[2].trim(),
+      body: markdown.slice(start, end).trim(),
+    };
+  });
+}
+
+function architectureChunks(root, filePath) {
+  const markdown = fs.readFileSync(filePath, "utf8");
+  const sourcePath = path.relative(root, filePath);
+  const adrDirectory = path.join(root, "docs", "adr");
+  const docType = path.basename(filePath) === "CONTEXT.md"
+    ? "context"
+    : filePath.startsWith(`${adrDirectory}${path.sep}`)
+      ? "adr"
+      : "doc";
+  return architectureSections(markdown).map((section, sectionIndex) => {
+    const searchableBody = [sourcePath, section.heading, section.body].join("\n\n");
+    return {
+      source_path: sourcePath,
+      section_index: sectionIndex,
+      heading: section.heading,
+      doc_type: docType,
+      body: section.body,
+      content_hash: crypto.createHash("sha256").update(searchableBody).digest("hex"),
+      searchable_body: searchableBody,
+    };
+  });
+}
+
+function formatArchitectureDocument(row, distance) {
+  const document = {
+    source_path: row.source_path,
+    section_index: row.section_index,
+    heading: row.heading,
+    doc_type: row.doc_type,
+    body: row.body,
+    content_hash: row.content_hash,
+    embedding_status: row.embedding_status,
+    embedding_error: row.embedding_error,
+    embedding_bytes: row.embedding ? row.embedding.length : 0,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+  if (distance !== undefined) document.distance = distance;
+  return document;
+}
+
+function upsertArchitectureDocument(store, chunk, embedding, error = null) {
+  const timestamp = now();
+  const embeddingStatus = embedding ? "ready" : "failed";
+  const sql = `
+    INSERT INTO architecture_documents (
+      source_path, section_index, heading, doc_type, body, content_hash,
+      embedding, embedding_status, embedding_error, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ${embedding ? "vector_as_f32(?)" : "NULL"}, ?, ?, ?, ?)
+    ON CONFLICT(source_path, section_index) DO UPDATE SET
+      heading = excluded.heading,
+      doc_type = excluded.doc_type,
+      body = excluded.body,
+      content_hash = excluded.content_hash,
+      embedding = excluded.embedding,
+      embedding_status = excluded.embedding_status,
+      embedding_error = excluded.embedding_error,
+      updated_at = excluded.updated_at
+  `;
+  const statement = store.db.prepare(sql);
+  if (embedding) {
+    statement.run(
+      chunk.source_path,
+      chunk.section_index,
+      chunk.heading,
+      chunk.doc_type,
+      chunk.body,
+      chunk.content_hash,
+      vectorJson(embedding),
+      embeddingStatus,
+      null,
+      timestamp,
+      timestamp,
+    );
+  } else {
+    statement.run(
+      chunk.source_path,
+      chunk.section_index,
+      chunk.heading,
+      chunk.doc_type,
+      chunk.body,
+      chunk.content_hash,
+      embeddingStatus,
+      error,
+      timestamp,
+      timestamp,
+    );
+  }
+}
+
+function indexArchitectureDocuments(store, options) {
+  const files = architectureDocumentFiles(options.root);
+  const chunks = files.flatMap((filePath) => architectureChunks(options.root, filePath));
+  const existing = store.db.prepare("SELECT * FROM architecture_documents ORDER BY id").all();
+  const existingByKey = new Map(
+    existing.map((row) => [`${row.source_path}:${row.section_index}`, row]),
+  );
+  const desiredKeys = new Set(
+    chunks.map((chunk) => `${chunk.source_path}:${chunk.section_index}`),
+  );
+  const stale = existing.filter(
+    (row) => !desiredKeys.has(`${row.source_path}:${row.section_index}`),
+  );
+  const pending = chunks.filter((chunk) => {
+    const row = existingByKey.get(`${chunk.source_path}:${chunk.section_index}`);
+    return !row || row.content_hash !== chunk.content_hash || row.embedding_status !== "ready";
+  });
+
+  emitProgress(`아키텍처 문서 ${files.length}개, section ${chunks.length}개를 확인합니다.`);
+  let embeddings = [];
+  let embeddingError = null;
+  if (pending.length > 0) {
+    try {
+      embeddings = createEmbeddings(
+        options.root,
+        pending.map((chunk) => chunk.searchable_body),
+        options.embeddingCommand,
+        pending.map((chunk) => `${chunk.source_path}#${chunk.heading}`),
+      );
+    } catch (error) {
+      embeddingError = error instanceof Error ? error.message : String(error);
+      emitProgress(`아키텍처 문서 임베딩 실패; 원문은 저장합니다: ${embeddingError}`);
+    }
+  }
+
+  const embeddingByKey = new Map(
+    pending.map((chunk, index) => [
+      `${chunk.source_path}:${chunk.section_index}`,
+      embeddings[index],
+    ]),
+  );
+  const transaction = store.db.transaction(() => {
+    for (const row of stale) {
+      store.db
+        .prepare("DELETE FROM architecture_documents WHERE source_path = ? AND section_index = ?")
+        .run(row.source_path, row.section_index);
+    }
+    for (const chunk of chunks) {
+      const key = `${chunk.source_path}:${chunk.section_index}`;
+      const existingRow = existingByKey.get(key);
+      if (
+        existingRow &&
+        existingRow.content_hash === chunk.content_hash &&
+        existingRow.embedding_status === "ready"
+      ) {
+        continue;
+      }
+      upsertArchitectureDocument(store, chunk, embeddingByKey.get(key), embeddingError);
+    }
+  });
+  transaction();
+
+  const failed = pending.filter((chunk) => !embeddingByKey.get(`${chunk.source_path}:${chunk.section_index}`));
+  emitProgress(
+    `아키텍처 문서 색인 완료: ${pending.length - failed.length}개 임베딩, ${failed.length}개 실패, ${stale.length}개 제거.`,
+  );
+  return {
+    files: files.map((file) => path.relative(options.root, file)),
+    document_count: chunks.length,
+    embedded_count: pending.length - failed.length,
+    failed_count: failed.length,
+    removed_count: stale.length,
+    failed_documents: failed.map((chunk) => `${chunk.source_path}#${chunk.heading}`),
+  };
+}
+
+function searchArchitectureDocuments(store, options) {
+  const query = String(options.query || options.q || options.positionals?.[0] || "").trim();
+  if (!query) throw new Error("architecture search query가 필요합니다.");
+  const limit = Math.max(1, Math.min(Number(options.limit || 8), 50));
+  emitProgress("아키텍처 검색어 임베딩 생성을 시작합니다.");
+  const embedding = createEmbedding(options.root, query, options.embeddingCommand);
+  const rows = store.db.prepare(`
+    SELECT v.rowid, v.distance
+    FROM vector_full_scan('architecture_documents', 'embedding', vector_as_f32(?)) AS v
+    JOIN architecture_documents AS d ON d.id = v.rowid
+    WHERE d.embedding_status = 'ready'
+    ORDER BY v.distance ASC
+    LIMIT ?
+  `).all(vectorJson(embedding), limit);
+  emitProgress(`아키텍처 문서 검색 완료: ${rows.length}개 결과.`);
+  return rows.map((row) =>
+    formatArchitectureDocument(
+      store.db.prepare("SELECT * FROM architecture_documents WHERE id = ?").get(row.rowid),
+      row.distance,
+    ),
+  );
 }
 
 function validateIssueId(issueId) {
@@ -374,25 +703,36 @@ function reembedFailed(store, options) {
     "SELECT * FROM issues WHERE embedding_status IN ('failed', 'missing') ORDER BY id",
   ).all();
   emitProgress(`재임베딩 대상 ${rows.length}개를 읽었습니다.`);
+  if (rows.length === 0) return [];
+
+  const labels = rows.map((row) => row.issue_id);
+  const inputs = rows.map((row) => bodyForEmbedding({
+    issue_id: row.issue_id,
+    triage_label: row.triage_label,
+    title: row.title,
+    body: row.body,
+    parent_issue_id: row.parent_issue_id,
+    blockedBy: blockersFor(store.db, row.issue_id),
+  }));
+  let embeddings;
+  let failure = null;
+  try {
+    emitProgress(`재임베딩을 한 프로세스로 처리합니다: ${rows.length}개.`);
+    embeddings = createEmbeddings(options.root, inputs, options.embeddingCommand, labels);
+  } catch (error) {
+    failure = error instanceof Error ? error.message : String(error);
+    emitProgress(`일괄 재임베딩 실패: ${failure}`);
+  }
+
   const results = [];
-  for (const row of rows) {
-    emitProgress(`${row.issue_id} 재임베딩을 시작합니다.`);
-    try {
-      const embedding = createEmbedding(options.root, bodyForEmbedding({
-        issue_id: row.issue_id,
-        triage_label: row.triage_label,
-        title: row.title,
-        body: row.body,
-        parent_issue_id: row.parent_issue_id,
-        blockedBy: blockersFor(store.db, row.issue_id),
-      }), options.embeddingCommand);
-      updateEmbedding(store, row, embedding);
-      emitProgress(`${row.issue_id} 재임베딩 및 SQLite 갱신 완료.`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      updateEmbedding(store, row, null, message);
-      emitProgress(`${row.issue_id} 재임베딩 실패: ${message}`);
-    }
+  for (const [index, row] of rows.entries()) {
+    const embedding = embeddings?.[index];
+    updateEmbedding(store, row, embedding, failure);
+    emitProgress(
+      embedding
+        ? `${row.issue_id} 재임베딩 및 SQLite 갱신 완료.`
+        : `${row.issue_id} 재임베딩 실패: ${failure}`,
+    );
     results.push(formatIssue(store.db, issueRow(store.db, row.issue_id)));
   }
   return results;
@@ -471,18 +811,20 @@ function migrate(store, options) {
   const labels = candidates.map(
     (issue) => `${path.relative(options.root, issue.source_file)} → ${issue.issue_id} (${issue.title})`,
   );
-  emitProgress(`임베딩 사전 검증을 시작합니다: ${candidates.length}개 이슈를 한 프로세스로 처리합니다.`);
-  let embeddings;
-  try {
-    embeddings = createEmbeddings(
-      options.root,
-      candidates.map((issue) => bodyForEmbedding(issue)),
-      options.embeddingCommand,
-      labels,
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`마이그레이션을 중단했습니다. 임베딩 사전 검증에 실패했습니다: ${message}`);
+  let embeddings = [];
+  if (candidates.length > 0) {
+    emitProgress(`임베딩 사전 검증을 시작합니다: ${candidates.length}개 이슈를 한 프로세스로 처리합니다.`);
+    try {
+      embeddings = createEmbeddings(
+        options.root,
+        candidates.map((issue) => bodyForEmbedding(issue)),
+        options.embeddingCommand,
+        labels,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`마이그레이션을 중단했습니다. 임베딩 사전 검증에 실패했습니다: ${message}`);
+    }
   }
   for (const [index, issue] of candidates.entries()) {
     pending.push({ issue, embedding: embeddings[index] });
@@ -508,6 +850,43 @@ function migrate(store, options) {
   }
   emitProgress(`Markdown 마이그레이션 완료: ${migrated.length}개 저장, ${skipped.length}개 건너뜀.`);
   return { migrated, skipped, source_files: sourceFiles.map((file) => path.relative(options.root, file)) };
+}
+
+function pruneMigratedMarkdown(store, options) {
+  const sourceFiles = markdownIssueFiles(options.root);
+  const parsed = sourceFiles.flatMap(parseMarkdownFile);
+  const unique = new Map(parsed.map((issue) => [issue.issue_id, issue]));
+  const missing = [...unique.keys()].filter((issueId) => !issueRow(store.db, issueId));
+  if (missing.length > 0) {
+    throw new Error(`SQLite에 없는 Markdown 이슈가 있어 축약을 중단합니다: ${missing.join(", ")}`);
+  }
+  if (!options.yes) {
+    throw new Error("Markdown 축약은 데이터 손실을 수반하므로 --yes 확인이 필요합니다.");
+  }
+
+  const pruned = [];
+  for (const filePath of sourceFiles) {
+    const original = fs.readFileSync(filePath, "utf8");
+    if (!/^###\s+T-\d{3}\b/m.test(original)) continue;
+    const firstIssue = original.search(/^###\s+T-\d{3}\b/m);
+    const preamble = firstIssue >= 0 ? original.slice(0, firstIssue).trimEnd() : "";
+    const title = preamble || `# ${path.basename(filePath, ".md")}`;
+    const replacement = [
+      title,
+      "",
+      "> 이 파일의 T-### 이슈 source of truth는 `docs/issues.sqlite`입니다.",
+      "> 기존 Markdown 본문은 SQLite로 마이그레이션되었으며 Git history에서 확인할 수 있습니다.",
+      "> 새 이슈 발행·조회·상태 변경은 agent 설치 위치의 `scripts/issue-store.js` CLI에 `--root`를 넘겨 수행하세요.",
+      "",
+    ].join("\n");
+    fs.writeFileSync(filePath, replacement, "utf8");
+    pruned.push(path.relative(options.root, filePath));
+  }
+  emitProgress(`마이그레이션된 Markdown ${pruned.length}개 파일을 source-of-truth 안내문으로 축약했습니다.`);
+  return {
+    pruned_files: pruned,
+    issue_count: unique.size,
+  };
 }
 
 function listIssues(store, options) {
@@ -627,18 +1006,28 @@ function run(argv = process.argv.slice(2)) {
   let store;
   try {
     if (command === "help") {
-      print({ ok: true, commands: ["init", "migrate", "create", "get", "list", "update-status", "search", "reembed-failed"] });
+      print({ ok: true, commands: ["init", "migrate", "index-architecture", "prune-migrated", "create", "get", "list", "update-status", "search", "search-architecture", "reembed-failed"] });
       return;
     }
     store = openStore(dbPath);
     const options = optionsWithPayload({ ...parsed, root });
     if (command === "init") {
-      print({ ok: true, command, db_path: dbPath, vector: { loaded: true, version: store.vectorVersion, dimension: VECTOR_DIMENSION }, schema: ["issues", "issue_blockers"] });
+      print({ ok: true, command, db_path: dbPath, vector: { loaded: true, version: store.vectorVersion, dimension: VECTOR_DIMENSION }, schema: ["issues", "issue_blockers", "architecture_documents"] });
       return;
     }
     if (command === "migrate") {
       const result = migrate(store, options);
       print({ ok: true, command, ...result, count: result.migrated.length, issues: result.migrated });
+      return;
+    }
+    if (command === "index-architecture") {
+      const result = indexArchitectureDocuments(store, options);
+      print({ ok: true, command, ...result });
+      return;
+    }
+    if (command === "prune-migrated") {
+      const result = pruneMigratedMarkdown(store, options);
+      print({ ok: true, command, ...result });
       return;
     }
     if (command === "create") {
@@ -672,6 +1061,11 @@ function run(argv = process.argv.slice(2)) {
       print({ ok: true, command, query: options.query || options.q || options.positionals[0], count: results.length, results });
       return;
     }
+    if (command === "search-architecture") {
+      const results = searchArchitectureDocuments(store, options);
+      print({ ok: true, command, query: options.query || options.q || options.positionals[0], count: results.length, results });
+      return;
+    }
     if (command === "reembed-failed") {
       const results = reembedFailed(store, options);
       print({ ok: true, command, count: results.length, issues: results });
@@ -693,9 +1087,16 @@ module.exports = {
   SCHEMA_SQL,
   parseArgs,
   parseMarkdownFile,
+  defaultEmbeddingPythonCandidates,
   chooseEmbeddingCommand: embeddingCommand,
   parseEmbeddingOutput,
   bodyForEmbedding,
+  architectureDocumentFiles,
+  architectureSections,
+  architectureChunks,
+  indexArchitectureDocuments,
+  searchArchitectureDocuments,
+  pruneMigratedMarkdown,
   openStore,
   closeStore,
   run,

@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 This skill takes the current conversation context and codebase understanding and produces a PRD. Do NOT interview the user — just synthesize what you already know.
 
-The issue tracker and triage label vocabulary should have been provided to you — run `/setup-matt-pocock-skills` if not. Read the project's issue-tracker document and use `scripts/issue-store.js` as the only publishing interface.
+The issue tracker and triage label vocabulary should have been provided to you — run `/setup-matt-pocock-skills` if not. Read the project's issue-tracker document and use the installed agent `scripts/issue-store.js` CLI as the only publishing interface. Resolve the agent directory as `${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}` and pass the target project root with `--root`; do not require the target project to contain `scripts/issue-store.js`.
 
 ## Process
 
@@ -16,7 +16,7 @@ The issue tracker and triage label vocabulary should have been provided to you �
 
 Check with the user that these seams match their expectations.
 
-3. Write the PRD using the template below, then publish it with `node scripts/issue-store.js create --json` (stdin JSON with `title`, `label: ready-for-agent`, `status: backlog`, and `body`). Do not append to `docs/tasks/*.md` directly. PRDs are stored as the body of a parent `(PRD)` issue, not as a separate entity.
+3. Write the PRD using the template below, then publish it with `AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"; node "$AGENT_DIR/scripts/issue-store.js" create --json --root "<project-root>"` (stdin JSON with `title`, `label: ready-for-agent`, `status: backlog`, and `body`). Do not append to `docs/tasks/*.md` directly. PRDs are stored as the body of a parent `(PRD)` issue, not as a separate entity.
 
 <prd-template>
 

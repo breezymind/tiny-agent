@@ -31,7 +31,6 @@ mcp.json
 
 docs/issues.sqlite-wal
 docs/issues.sqlite-shm
-docs/issues.sqlite
 
 # ─────────────────────────────────────────────
 # 캐시 / 생성물 (재생성 가능)

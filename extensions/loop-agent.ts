@@ -14,6 +14,9 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   chooseParallelCodingTasksFromIssues as selectParallelCodingTasksFromIssues,
 } from "./lib/issue-task-selection.js";
+import {
+  shouldWaitForPlanningInterview,
+} from "./lib/loop-agent-planning.js";
 
 // loop-agent: 새 세션의 첫 메시지 또는 /hard-goal을 자동 계획 파이프라인으로 감싸
 // 하나의 턴에서 grill-with-docs → to-prd → to-issues → grill-checklist
@@ -43,6 +46,8 @@ const PLANNING_PIPELINE_SKILLS = [
 ] as const;
 const CHECKLIST_START = "<!-- grill-checklist:start -->";
 const CHECKLIST_END = "<!-- grill-checklist:end -->";
+const ARCHITECTURE_CHECKLIST_ITEM =
+  "- [ ] 변경된 코드가 CONTEXT.md와 관련 ADR에 정의된 아키텍처 책임 경계·source of truth·불변조건을 지킨다.";
 const WORKFLOW_MARKER_PREFIX = "<!-- loop-agent-workflow:";
 const REVIEW_START = "<!-- grill-review:start -->";
 const REVIEW_END = "<!-- grill-review:end -->";
@@ -61,6 +66,11 @@ const PACKAGE_ROOT = path.resolve(
   "..",
 );
 const PACKAGE_SKILLS_DIR = path.join(PACKAGE_ROOT, "skills");
+const PACKAGE_ISSUE_STORE_CLI_PATH = path.join(
+  PACKAGE_ROOT,
+  "scripts",
+  "issue-store.js",
+);
 const AGENT_SKILLS_DIR = path.join(AGENT_DIR, "skills");
 // 설치된 Pi 패키지에서는 패키지 내부 스킬을 우선 사용하고, 단일 확장으로
 // 로드하는 개발/호환 경로에서는 기존 전역 agent 홈을 fallback으로 사용한다.
@@ -89,13 +99,59 @@ function skillPath(skillName: string): string {
 type ProjectDocPaths = {
   issueTracker: string;
   changesDir: string;
+  architectureContext: string;
+  architectureAdrDir: string;
 };
 function projectDocPaths(root: string): ProjectDocPaths {
   const docs = path.join(root, "docs");
   return {
     issueTracker: path.join(docs, "agents", "issue-tracker.md"),
     changesDir: path.join(docs, "changes"),
+    architectureContext: path.join(root, "CONTEXT.md"),
+    architectureAdrDir: path.join(docs, "adr"),
   };
+}
+
+function architectureDocumentPaths(root: string): string[] {
+  const docs = projectDocPaths(root);
+  const paths = [docs.architectureContext];
+  const docsDirectory = path.dirname(path.dirname(docs.issueTracker));
+  if (fs.existsSync(docsDirectory)) {
+    for (const entry of fs.readdirSync(docsDirectory, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.endsWith(".md")) {
+        paths.push(path.join(docsDirectory, entry.name));
+      }
+    }
+  }
+  if (fs.existsSync(docs.architectureAdrDir)) {
+    const walk = (directory: string): void => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const filePath = path.join(directory, entry.name);
+        if (entry.isDirectory()) walk(filePath);
+        else if (entry.isFile() && entry.name.endsWith(".md")) {
+          paths.push(filePath);
+        }
+      }
+    };
+    walk(docs.architectureAdrDir);
+  }
+  return paths.filter((filePath) => fs.existsSync(filePath)).sort();
+}
+
+function buildArchitectureReadGuidance(root: string): string {
+  const docs = projectDocPaths(root);
+  const architecturePaths = architectureDocumentPaths(root);
+  return [
+    "<architecture-read-gate>",
+    "구현 계획을 확정하거나 코드를 수정하기 전에 아래 아키텍처 문서를 read 도구로 직접 읽어라.",
+    "문서 벡터 검색 결과는 관련 문서 후보를 찾기 위한 보조 수단이며 직접 읽기를 대체하지 않는다.",
+    ...architecturePaths.map((filePath) => `- ${filePath}`),
+    `- 이슈 생성·상태 변경·조회가 필요하면 ${docs.issueTracker}`,
+    "읽은 뒤 현재 작업에 적용되는 source of truth, 변경하지 않을 책임 경계, 관련 ADR을 작업 계획에 명시하라.",
+    "최종 목표 체크리스트에는 변경된 코드가 위 아키텍처의 책임 경계, source of truth, 불변조건을 지키는지 확인하는 항목을 작업 크기와 무관하게 항상 포함하라.",
+    "필수 아키텍처 문서를 읽을 수 없으면 추측으로 구현하지 말고 먼저 중단하라.",
+    "</architecture-read-gate>",
+  ].join("\n");
 }
 
 function issueStoreDatabasePath(root: string): string {
@@ -132,6 +188,22 @@ function hasLegacyMarkdownIssues(root: string): boolean {
       return false;
     }
   });
+}
+
+function findMissingArchitecturePrerequisite(root: string): string | null {
+  const docs = projectDocPaths(root);
+  const required = [
+    docs.architectureContext,
+    path.join(docs.architectureAdrDir, "0003-architecture-baseline-and-read-gate.md"),
+  ];
+  for (const filePath of required) {
+    try {
+      fs.accessSync(filePath, fs.constants.R_OK);
+    } catch {
+      return filePath;
+    }
+  }
+  return null;
 }
 
 // 새 프로젝트에는 docs 트리가 없다. 파이프라인이 요구하는 이슈 트래커 규약
@@ -175,18 +247,24 @@ function currentYearMonth(): string {
   return `${year}-${month}`;
 }
 
+function issueStoreCliShellCommand(root: string, args: string): string {
+  return `AGENT_DIR="\${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"; node "$AGENT_DIR/scripts/issue-store.js" ${args} --root ${JSON.stringify(root)}`;
+}
+
 // 코딩 에이전트(초기 실행·개선 라운드)에게 SQLite 이슈 상태 전이를
 // 강제하는 공통 지침. 확장은 상태를 직접 바꾸지 않고 CLI 경계를 주입한다.
 function buildTaskTrackingInstructions(root: string): string {
   const month = currentYearMonth();
   const docs = projectDocPaths(root);
+  const startCommand = issueStoreCliShellCommand(root, "update-status T-### current");
+  const doneCommand = issueStoreCliShellCommand(root, "update-status T-### done");
   return [
     "<task-tracking>",
     `이 프로젝트의 이슈 트래커는 ${path.join(root, "docs", "issues.sqlite")}이며 규약은 ${docs.issueTracker} 참조.`,
-    `Markdown 태스크 파일을 source of truth로 읽거나 직접 수정하지 말고 ${path.join(root, "scripts", "issue-store.js")} CLI만 사용하라.`,
+    "Markdown 태스크 파일을 source of truth로 읽거나 직접 수정하지 말고, agent 설치 위치의 issue-store CLI만 사용하라. PI_CODING_AGENT_DIR가 없으면 ~/.pi/agent를 agent 설치 위치로 사용한다.",
     "",
-    "1) 착수: 담당 T-###를 `node scripts/issue-store.js update-status T-### current`로 전이하라.",
-    "2) 완료: 모든 수용 기준을 만족하면 `node scripts/issue-store.js update-status T-### done`으로 전이하라.",
+    `1) 착수: 담당 T-###를 \`${startCommand}\`로 전이하라.`,
+    `2) 완료: 모든 수용 기준을 만족하면 \`${doneCommand}\`로 전이하라.`,
     `3) 사소한 변경: 큰 태스크가 아닌 부수 변경(오타·문구·리팩터·설정 등)은`,
     `   ${path.join(docs.changesDir, `${month}.md`)}에 "- ${month}-DD: 요약 (관련 T-### 있으면 참조)" 형태로 append하라.`,
     "</task-tracking>",
@@ -200,6 +278,7 @@ function buildQuickChecklist(objective: string): string {
     `- [ ] 요청 "${summary}" 를 최소 변경으로 구현했다.`,
     "- [ ] 관련 검증(테스트, 빌드, 정적 검사) 중 필요한 것을 실행했다.",
     "- [ ] 기존의 직접 연관된 동작을 불필요하게 바꾸지 않았다.",
+    ARCHITECTURE_CHECKLIST_ITEM,
   ].join("\n");
 }
 
@@ -215,7 +294,7 @@ function buildDirectCodingPrompt(objective: string, root: string): {
     "다음 체크리스트를 만족하도록 작업하라:",
     checklist,
     "",
-    buildImplementSkillGuidance(),
+    buildImplementSkillGuidance(root),
     "",
     buildTaskTrackingInstructions(root),
     "",
@@ -239,6 +318,30 @@ type IssueStoreRecord = {
   body?: unknown;
   [key: string]: unknown;
 };
+
+type ArchitectureDocumentRecord = {
+  source_path?: unknown;
+  section_index?: unknown;
+  heading?: unknown;
+  doc_type?: unknown;
+  body?: unknown;
+  distance?: unknown;
+  [key: string]: unknown;
+};
+
+type SemanticSearchContext = {
+  query: string;
+  results: IssueStoreRecord[];
+  architectureResults: ArchitectureDocumentRecord[];
+};
+
+type GoalPipelinePreparation =
+  | { prompt: string }
+  | { blocked: true }
+  | null;
+
+const REQUIRED_SEMANTIC_SEARCH_LIMIT = 8;
+const SEMANTIC_RESULT_BODY_LIMIT = 2400;
 
 function parseLastJsonObject(stdout: string): Record<string, unknown> | undefined {
   for (const line of stdout.trim().split("\n").reverse()) {
@@ -276,7 +379,7 @@ function resolveIssueStoreCliInvocation(
   args: string[],
 ): IssueStoreCliInvocation | undefined {
   const projectCliPath = path.join(root, "scripts", "issue-store.js");
-  const bundledCliPath = path.join(path.dirname(CONFIG_PATH), "scripts", "issue-store.js");
+  const bundledCliPath = PACKAGE_ISSUE_STORE_CLI_PATH;
   const cliPath = fs.existsSync(projectCliPath)
     ? projectCliPath
     : fs.existsSync(bundledCliPath)
@@ -286,13 +389,9 @@ function resolveIssueStoreCliInvocation(
 
   const cliArgs = [...args];
   if (!cliArgs.includes("--root")) cliArgs.push("--root", root);
-  if (
-    cliPath === bundledCliPath &&
-    !process.env.ISSUE_EMBEDDING_COMMAND &&
-    !cliArgs.includes("--embedding-command")
-  ) {
+  if (!process.env.ISSUE_EMBEDDING_COMMAND && !cliArgs.includes("--embedding-command")) {
     const bundledEmbeddingPath = path.join(
-      path.dirname(CONFIG_PATH),
+      PACKAGE_ROOT,
       "scripts",
       "issue-embedding.py",
     );
@@ -396,43 +495,227 @@ function loadIssueStoreRecords(
 
 async function maybeMigrateLegacyIssueStore(ctx: ExtensionContext): Promise<void> {
   const root = ctx.cwd;
-  if (fs.existsSync(issueStoreDatabasePath(root)) || !hasLegacyMarkdownIssues(root)) {
+  if (fs.existsSync(issueStoreDatabasePath(root))) {
+    // 기존 DB도 문서 원문이 바뀌었거나 이전 스키마로 생성되었을 수 있으므로
+    // 세션 시작 시 idempotent 색인을 실행해 최신 CONTEXT/ADR을 반영한다.
+    await ensureArchitectureVectorIndex(ctx);
     return;
   }
-  if (!ctx.hasUI) return;
 
-  const migrate = await ctx.ui.confirm(
-    "SQLite 이슈 저장소로 마이그레이션",
-    "기존 docs/tasks/*.md 이슈를 docs/issues.sqlite로 옮길까요? 원본 Markdown은 삭제하지 않습니다.",
-  );
-  if (!migrate) {
+  // 세션 시작 시에도 DB가 없으면 CONTEXT/ADR 원문을 먼저 문서 인덱스에
+  // 저장한다. 기존 구현은 legacy 이슈가 있을 때만 migrate를 실행했으므로,
+  // 이슈가 없거나 직접 코딩 경로를 타면 아키텍처 문서 인덱스가 만들어지지 않았다.
+  await ensureArchitectureVectorIndex(ctx);
+
+  if (!hasLegacyMarkdownIssues(root)) return;
+
+  if (ctx.hasUI) {
     ctx.ui.notify(
-      "loop-agent: Markdown 이슈를 마이그레이션하지 않았습니다. 다음 시작 때 다시 물어봅니다.",
+      "loop-agent: issues.sqlite가 없어 아키텍처 문서 색인과 기존 Markdown 이슈 마이그레이션을 자동 실행합니다. 원본 Markdown은 유지합니다.",
       "info",
     );
-    return;
   }
-
-  ctx.ui.notify(
-    "loop-agent: 기존 Markdown 이슈를 읽고 임베딩한 뒤 SQLite에 저장합니다.",
-    "info",
-  );
   const result = await runIssueStoreCliAsync(root, ["migrate"], (line) => {
-    ctx.ui.notify(`loop-agent: ${line}`, "info");
+    if (ctx.hasUI) ctx.ui.notify(`loop-agent: ${line}`, "info");
   });
   if (result?.ok !== true) {
-    ctx.ui.notify(
-      "loop-agent: SQLite 이슈 저장소 마이그레이션에 실패했습니다. 원본 Markdown은 유지됩니다.",
-      "error",
-    );
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        "loop-agent: SQLite 이슈 저장소 마이그레이션에 실패했습니다. 원본 Markdown은 유지됩니다.",
+        "error",
+      );
+    }
     return;
   }
 
   const count = typeof result.count === "number" ? result.count : 0;
+  if (ctx.hasUI) {
+    ctx.ui.notify(
+      `loop-agent: 기존 Markdown 이슈 ${count}개를 docs/issues.sqlite로 마이그레이션했습니다.`,
+      "info",
+    );
+  }
+}
+
+function notifySemanticSearchProgress(ctx: ExtensionContext, line: string): void {
+  ctx.ui.notify(`loop-agent: semantic search - ${line}`, "info");
+}
+
+async function ensureArchitectureVectorIndex(ctx: ExtensionContext): Promise<boolean> {
+  const indexed = await runIssueStoreCliAsync(
+    ctx.cwd,
+    ["index-architecture"],
+    (line) => notifySemanticSearchProgress(ctx, line),
+  );
+  if (indexed?.ok !== true) {
+    ctx.ui.notify(
+      "loop-agent: ADR/CONTEXT 벡터 색인에 실패했습니다. 원문 직접 읽기 게이트는 계속 적용합니다.",
+      "warning",
+    );
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 자동 계획 파이프라인의 필수 검색 경계다. 저장소가 없는 새 프로젝트는
+ * 먼저 SQLite/vector 저장소를 초기화하고, legacy Markdown 이슈가 있으면
+ * 자동 마이그레이션한다. 이슈 semantic search는 필수지만 아키텍처 문서
+ * semantic search는 보조 수단이며, 실제 문서 직접 읽기 게이트가 기준이다.
+ */
+async function runRequiredSemanticSearch(
+  ctx: ExtensionContext,
+  objective: string,
+): Promise<SemanticSearchContext | null> {
+  const root = ctx.cwd;
+  const databasePath = issueStoreDatabasePath(root);
+  let architectureIndexed = false;
+
+  if (!fs.existsSync(databasePath)) {
+    // 이슈 마이그레이션이 임베딩 환경 문제로 중단되어도 아키텍처 문서는
+    // 먼저 보존·색인되어야 한다. index-architecture가 DB도 함께 생성한다.
+    architectureIndexed = await ensureArchitectureVectorIndex(ctx);
+    if (hasLegacyMarkdownIssues(root)) {
+      const migrated = await runIssueStoreCliAsync(
+        root,
+        ["migrate"],
+        (line) => notifySemanticSearchProgress(ctx, line),
+      );
+      if (migrated?.ok !== true) {
+        ctx.ui.notify(
+          "loop-agent: 기존 Markdown 이슈를 SQLite로 옮기지 못해 자동 파이프라인을 중단합니다. 원본 Markdown은 유지됩니다.",
+          "error",
+        );
+        return null;
+      }
+    } else {
+      const initialized = await runIssueStoreCliAsync(
+        root,
+        ["init"],
+        (line) => notifySemanticSearchProgress(ctx, line),
+      );
+      if (initialized?.ok !== true) {
+        ctx.ui.notify(
+          "loop-agent: semantic search용 SQLite/vector 저장소를 초기화하지 못해 자동 파이프라인을 중단합니다.",
+          "error",
+        );
+        return null;
+      }
+    }
+  }
+
+  if (!architectureIndexed) await ensureArchitectureVectorIndex(ctx);
+
+  const response = await runIssueStoreCliAsync(
+    root,
+    ["search", objective, "--limit", String(REQUIRED_SEMANTIC_SEARCH_LIMIT)],
+    (line) => notifySemanticSearchProgress(ctx, line),
+  );
+  if (response?.ok !== true) {
+    ctx.ui.notify(
+      "loop-agent: 필수 semantic search에 실패해 자동 파이프라인을 중단합니다. 임베딩 환경(ISSUE_EMBEDDING_COMMAND/Python)을 확인하세요.",
+      "error",
+    );
+    return null;
+  }
+
+  if (!Array.isArray(response.results)) {
+    ctx.ui.notify(
+      "loop-agent: semantic search 결과 형식이 올바르지 않아 자동 파이프라인을 중단합니다.",
+      "error",
+    );
+    return null;
+  }
+
+  const results = (response.results as IssueStoreRecord[]).slice(
+    0,
+    REQUIRED_SEMANTIC_SEARCH_LIMIT,
+  );
   ctx.ui.notify(
-    `loop-agent: 기존 Markdown 이슈 ${count}개를 docs/issues.sqlite로 마이그레이션했습니다.`,
+    `loop-agent: semantic search 완료 (${results.length}개 결과).`,
     "info",
   );
+
+  const architectureResponse = await runIssueStoreCliAsync(
+    root,
+    ["search-architecture", objective, "--limit", String(REQUIRED_SEMANTIC_SEARCH_LIMIT)],
+    (line) => notifySemanticSearchProgress(ctx, line),
+  );
+  const architectureResults = architectureResponse?.ok === true && Array.isArray(architectureResponse.results)
+    ? (architectureResponse.results as ArchitectureDocumentRecord[]).slice(
+      0,
+      REQUIRED_SEMANTIC_SEARCH_LIMIT,
+    )
+    : [];
+  if (architectureResponse?.ok !== true) {
+    ctx.ui.notify(
+      "loop-agent: ADR/CONTEXT semantic search를 사용할 수 없습니다. 기준 문서는 직접 읽습니다.",
+      "warning",
+    );
+  } else {
+    ctx.ui.notify(
+      `loop-agent: ADR/CONTEXT semantic search 완료 (${architectureResults.length}개 결과).`,
+      "info",
+    );
+  }
+  return { query: objective, results, architectureResults };
+}
+
+function formatSemanticSearchContext(context: SemanticSearchContext): string {
+  const issueEntries = context.results.map((record, index) => {
+    const issueId = String(record.issue_id ?? `result-${index + 1}`);
+    const title = String(record.title ?? "제목 없음");
+    const status = String(record.status ?? "unknown");
+    const label = String(record.triage_label ?? record.label ?? "unknown");
+    const distance = typeof record.distance === "number"
+      ? `, distance=${record.distance.toFixed(4)}`
+      : "";
+    const body = typeof record.body === "string"
+      ? record.body.trim().slice(0, SEMANTIC_RESULT_BODY_LIMIT)
+      : "";
+    return [
+      `### ${issueId}: ${title}`,
+      `- 상태: ${status}, 라벨: ${label}${distance}`,
+      body ? body : "- 본문 없음",
+    ].join("\n");
+  });
+
+  const architectureEntries = context.architectureResults.map((record, index) => {
+    const sourcePath = String(record.source_path ?? `architecture-result-${index + 1}`);
+    const heading = String(record.heading ?? "문서 section");
+    const distance = typeof record.distance === "number"
+      ? `, distance=${record.distance.toFixed(4)}`
+      : "";
+    const body = typeof record.body === "string"
+      ? record.body.trim().slice(0, SEMANTIC_RESULT_BODY_LIMIT)
+      : "";
+    return [
+      `### ${sourcePath}#${heading}`,
+      `- 문서 종류: ${String(record.doc_type ?? "unknown")}${distance}`,
+      body ? body : "- 본문 없음",
+    ].join("\n");
+  });
+
+  return [
+    "<loop-agent-semantic-context>",
+    `검색어: ${context.query}`,
+    issueEntries.length > 0
+      ? "아래는 자동 계획 시작 전에 issue-store semantic search로 찾은 기존 이슈 후보다."
+      : "검색은 성공했지만 관련 기존 이슈가 없습니다. 새 요구사항으로 판단하라.",
+    "현재 사용자 요구와 실제 코드가 우선이며, 이슈 결과는 검증해야 하는 참고 문맥으로만 사용하라.",
+    "",
+    issueEntries.join("\n\n"),
+    "</loop-agent-semantic-context>",
+    "",
+    "<loop-agent-architecture-context>",
+    `검색어: ${context.query}`,
+    architectureEntries.length > 0
+      ? "아래는 ADR/CONTEXT vector search가 찾은 관련 문서 section 후보이다. 반드시 원문을 직접 read한 뒤 사용하라."
+      : "ADR/CONTEXT vector search 결과가 없거나 실패했다. 기준 문서는 프롬프트의 read 경로로 직접 읽어라.",
+    "",
+    architectureEntries.join("\n\n"),
+    "</loop-agent-architecture-context>",
+  ].join("\n");
 }
 
 export function chooseParallelCodingTasksFromIssues(
@@ -470,7 +753,7 @@ function buildParallelTaskCodingPrompt(
     `실제 수정 대상 루트: ${root}`,
     "가능하면 이 서브태스크와 직접 관련된 파일만 건드리고, 완료 후 변경 내용과 실행한 검증만 간단히 보고하라.",
     "",
-    buildImplementSkillGuidance(),
+    buildImplementSkillGuidance(root),
     "",
     "<parallel-task>",
     `담당 태스크: ${task.id} ${task.title}`,
@@ -499,7 +782,7 @@ function buildParallelIntegrationPrompt(
     "이제 남은 일만 처리하라: 교차 서브태스크 seam 정리, 누락된 최소 통합 수정, 그리고 태스크 추적 문서 갱신.",
     "이미 병합된 큰 구현을 다시 처음부터 뒤엎지 말고, 현재 워크트리를 직접 읽어 최소 보완만 하라.",
     "",
-    buildImplementSkillGuidance(),
+    buildImplementSkillGuidance(root),
     "",
     buildTaskTrackingInstructions(root),
     "",
@@ -837,18 +1120,59 @@ function ensureWorkflowWorkspace(
   return true;
 }
 
+/**
+ * 비동기 전처리보다 먼저 워크플로를 예약한다.
+ *
+ * ensureWorkflowWorkspace()만 통과시키고 await하면 두 목표가 모두
+ * workflowId가 없는 상태를 관찰할 수 있다. 예약은 동기적으로 수행되므로
+ * 두 번째 진입은 이후 ensureWorkflowWorkspace()에서 차단된다.
+ */
+function reserveWorkflow(
+  autoReview: boolean,
+  reviewStage: ReviewStage,
+  checklist: string | null,
+): string {
+  const workflowId = randomUUID();
+  state.armed = false;
+  state.autoMode = true;
+  state.autoReview = autoReview;
+  state.reviewStage = reviewStage;
+  state.checklist = checklist;
+  state.improvementRound = 0;
+  state.workflowId = workflowId;
+  return workflowId;
+}
+
+/** 예약 이후 clear 또는 새 세대가 시작됐으면 오래된 실패 처리를 버린다. */
+function releaseWorkflowIfCurrent(
+  pi: ExtensionAPI,
+  workflowId: string,
+  reason: string,
+): void {
+  if (state.workflowId !== workflowId) return;
+  state.reviewStage = "idle";
+  state.checklist = null;
+  state.improvementRound = 0;
+  state.autoMode = false;
+  state.autoReview = true;
+  state.workflowId = null;
+  persistWorkflowState(pi, reason);
+}
+
 // 구현 단계에서 따를 스킬: implement(구현 절차) + tdd(red-green-refactor 규율).
 // 자식 프로세스는 --no-skills로 실행되므로, 본문을 직접 붙이지 말고 파일 경로만
 // 알려준 뒤 read 도구로 읽게 한다.
 const IMPLEMENT_PIPELINE_SKILLS = ["implement", "tdd"] as const;
 
-function buildImplementSkillGuidance(): string {
+function buildImplementSkillGuidance(root: string): string {
   const skillFiles = IMPLEMENT_PIPELINE_SKILLS.map((skillName) =>
     skillPath(skillName),
   );
 
   return [
     "<implement-adapter>",
+    buildArchitectureReadGuidance(root),
+    "",
     "아래 스킬 파일을 먼저 직접 읽고 절차를 따르라. 본문을 프롬프트에 재인용하지 말라:",
     ...skillFiles.map((filePath) => `- ${filePath}`),
     "이 자동 파이프라인에서는 `/tdd`, `/code-review` 슬래시 호출을 스스로 하지 말라.",
@@ -1720,11 +2044,14 @@ function resolveTestThinkingLevel(): ThinkingLevel | null {
  * 첫 메시지를 파이프라인으로 삼켰다가 곧바로 실패하는 일을 막는다.
  */
 function findMissingPipelinePrerequisite(root: string): string | null {
+  const docs = projectDocPaths(root);
   const required = [
     skillPath("grilling"),
     skillPath("domain-modeling"),
     ...PLANNING_PIPELINE_SKILLS.map((skillName) => skillPath(skillName)),
-    projectDocPaths(root).issueTracker,
+    docs.issueTracker,
+    docs.architectureContext,
+    path.join(docs.architectureAdrDir, "0003-architecture-baseline-and-read-gate.md"),
   ];
   for (const filePath of required) {
     try {
@@ -1747,6 +2074,7 @@ function buildPlanningPipelinePrompt(
   objective: string,
   workflowId: string,
   root: string,
+  semanticContext: SemanticSearchContext,
 ): string {
   const docs = projectDocPaths(root);
   return [
@@ -1759,10 +2087,14 @@ function buildPlanningPipelinePrompt(
     `- ${skillPath("to-prd")}`,
     `- ${skillPath("to-issues")}`,
     `- ${docs.issueTracker}`,
+    buildArchitectureReadGuidance(root),
     "필요할 때는 `read` 도구로 해당 파일을 직접 읽어라. `grep`으로 본문을 재생산하지 말고, 한 번에 하나씩 읽어라.",
+    `grill-checklist의 최종 목표 체크리스트에는 반드시 다음 아키텍처 준수 검증 항목을 포함하라: ${ARCHITECTURE_CHECKLIST_ITEM}`,
     "한 번에 하나의 질문만 하고, 아직 물을 질문이 남았으면 그 턴은 질문으로 끝내라.",
     "이전 세션의 요약이나 추측을 섞지 말고, 위 파일과 현재 대화에서만 근거를 가져와라.",
     "</loop-agent-pipeline>",
+    "",
+    formatSemanticSearchContext(semanticContext),
     "",
     objective,
     "",
@@ -1952,7 +2284,10 @@ function extractChecklist(text: string): string | null {
   if (end < 0) return null;
 
   const checklist = text.slice(contentStart, end).trim();
-  return checklist.length > 0 ? checklist : null;
+  if (!checklist) return null;
+  return checklist.includes(ARCHITECTURE_CHECKLIST_ITEM)
+    ? checklist
+    : `${checklist}\n${ARCHITECTURE_CHECKLIST_ITEM}`;
 }
 
 /** 검수 에이전트의 기계 판독 JSON을 엄격히 검사해 재귀 개선 입력으로 사용한다. */
@@ -2399,7 +2734,7 @@ function buildImprovementPrompt(
     "실제 코드와 검증 결과를 확인해 실패 항목만 개선하고 관련 테스트를 실행하세요.",
     "기존에 통과한 항목을 회귀시키지 말고, 완료 후 변경 내용과 검증 근거를 보고하세요.",
     "",
-    buildImplementSkillGuidance(),
+    buildImplementSkillGuidance(root),
     "",
     buildTaskTrackingInstructions(root),
     "이 태스크는 이미 current.md에 있을 수 있으니, 수용 기준을 모두 만족한 뒤에만 archive로 이동하세요.",
@@ -2692,6 +3027,7 @@ function applyGateCommand(command: string, pi: ExtensionAPI): boolean {
       state.autoMode = false;
       state.autoReview = true;
       state.workflowId = null;
+      state.processingWorkflowId = null;
       // 상태만 리셋하면 이미 spawn된 자식 에이전트는 보이지 않는 채 계속
       // 실행되므로(부하), clear는 자식 프로세스까지 함께 회수해야 한다.
       killActiveChildren();
@@ -2792,20 +3128,21 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
 
   // /hard-goal, /easy-goal 명령과 첫 세션 메시지(input 핸들러)가 공유하는 반자동 파이프라인 진입점.
   // 워크플로 상태를 원자적으로 초기화하고 계획 모델을 고른 뒤 계획 프롬프트를
-  // 구성해 반환한다. 준비가 실패하면 null을 반환하고 상태를 되돌린다.
+  // 구성해 반환한다. semantic search가 실패하면 blocked를 반환해 원본 입력
+  // 경로로 우회하지 않는다. 그 밖의 준비 실패는 기존처럼 null로 반환한다.
   // 실제 입력 주입(sendUserMessage vs input transform)은 호출측이 맡는다.
   async function prepareGoalPipeline(
     ctx: ExtensionContext,
     objective: string,
     // 명시적 /hard-goal, /easy-goal은 전제 누락을 에러로 안내하지만, armed 첫 메시지처럼
-    // 암묵적으로 파이프라인에 태우는 경우엔 조용히 원본 입력을 통과시킨다.
+    // 암묵적으로 파이프라인에 태우는 경우엔 일반 전제 실패만 원본 입력으로 통과시킨다.
     { explicit = true, autoReview = true }: { explicit?: boolean; autoReview?: boolean } = {},
-): Promise<string | null> {
-  if (!ensureWorkflowWorkspace(ctx, explicit)) return null;
+  ): Promise<GoalPipelinePreparation> {
+    if (!ensureWorkflowWorkspace(ctx, explicit)) return null;
 
-  // 상태를 바꾸기 전에 남은 전제 파일(파이프라인 스킬)을 확인한다. 문서는 위에서
-  // 생성했으므로, 여기서 걸리는 건 대개 설치 폴더의 스킬 파일 누락이다. 없으면
-  // 워크플로를 시작하지 않고, 암묵적 경로에서는 원본 입력을 그대로 흘려보낸다.
+    // 상태를 바꾸기 전에 남은 전제 파일(파이프라인 스킬)을 확인한다. 문서는 위에서
+    // 생성했으므로, 여기서 걸리는 건 대개 설치 폴더의 스킬 파일 누락이다. 없으면
+    // 워크플로를 시작하지 않고, 암묵적 경로에서는 원본 입력을 그대로 흘려보낸다.
     const missing = findMissingPipelinePrerequisite(ctx.cwd);
     if (missing) {
       if (explicit) {
@@ -2817,16 +3154,17 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       return null;
     }
 
-    // 새 목표가 이전 작업의 체크리스트나 반복 횟수를 이어받지 않도록
-    // 워크플로 상태를 원자적으로 초기화한다.
-    state.armed = false;
-    state.autoMode = true;
-    state.autoReview = autoReview;
-    state.reviewStage = "idle";
-    state.checklist = null;
-    state.improvementRound = 0;
-    const workflowId = randomUUID();
-    state.workflowId = workflowId;
+    // 비동기 semantic search 전에 ID를 예약해야 다른 목표가 같은 빈 상태를
+    // 통과해 서로의 workflowId를 덮어쓰지 않는다.
+    const workflowId = reserveWorkflow(autoReview, "idle", null);
+
+    const semanticContext = await runRequiredSemanticSearch(ctx, objective);
+    if (!semanticContext) {
+      releaseWorkflowIfCurrent(pi, workflowId, "goal-search-failed");
+      return { blocked: true };
+    }
+    if (!isCurrentWorkflow(workflowId)) return null;
+
     persistWorkflowState(pi, "goal-started");
 
     const modelSelected = await selectModel(
@@ -2837,29 +3175,33 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       "계획",
     );
     if (!modelSelected) {
-      state.autoMode = false;
-      state.autoReview = true;
-      state.workflowId = null;
-      persistWorkflowState(pi, "planning-model-failed");
+      releaseWorkflowIfCurrent(pi, workflowId, "planning-model-failed");
       return null;
     }
+    if (!isCurrentWorkflow(workflowId)) return null;
 
     ctx.ui.notify(
       "loop-agent: 반자동 목표 파이프라인(인터뷰 → to-prd → to-issues → checklist → 자동 구현·검증)을 시작합니다. 1단계 인터뷰는 질문/답변을 주고받습니다.",
       "info",
     );
     try {
-      return buildPlanningPipelinePrompt(objective, workflowId, ctx.cwd);
+      return {
+        prompt: buildPlanningPipelinePrompt(
+          objective,
+          workflowId,
+          ctx.cwd,
+          semanticContext,
+        ),
+      };
     } catch (error) {
-      state.autoMode = false;
-      state.autoReview = true;
-      state.workflowId = null;
-      persistWorkflowState(pi, "goal-start-failed");
       const message = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify(
-        `loop-agent: 파이프라인 스킬 또는 issue-tracker 문서를 읽지 못했습니다: ${message}`,
-        "error",
-      );
+      if (isCurrentWorkflow(workflowId)) {
+        ctx.ui.notify(
+          `loop-agent: 파이프라인 스킬 또는 issue-tracker 문서를 읽지 못했습니다: ${message}`,
+          "error",
+        );
+      }
+      releaseWorkflowIfCurrent(pi, workflowId, "goal-start-failed");
       return null;
     }
   }
@@ -2873,16 +3215,23 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
   ): Promise<boolean> {
     if (!ensureWorkflowWorkspace(ctx, explicit)) return false;
 
-    const workflowId = randomUUID();
-    const { checklist, prompt } = buildDirectCodingPrompt(objective, ctx.cwd);
+    const missingArchitecture = findMissingArchitecturePrerequisite(ctx.cwd);
+    if (missingArchitecture) {
+      ctx.ui.notify(
+        `loop-agent: 아키텍처 읽기 게이트 문서가 없어 직접 코딩을 시작할 수 없습니다: ${missingArchitecture}`,
+        "error",
+      );
+      return false;
+    }
 
-    state.armed = false;
-    state.autoMode = true;
-    state.autoReview = autoReview;
-    state.reviewStage = "awaiting-execution";
-    state.checklist = checklist;
-    state.improvementRound = 0;
-    state.workflowId = workflowId;
+    const { checklist, prompt } = buildDirectCodingPrompt(objective, ctx.cwd);
+    // 직접/소규모 작업도 계획 파이프라인과 동일하게 DB가 없으면
+    // CONTEXT/ADR 문서 인덱스를 자동 생성한다. 구현 기준은 아래 read gate가
+    // 주입하는 직접 읽기이며, 벡터 검색은 후보 탐색용 보조 수단이다.
+    const workflowId = reserveWorkflow(autoReview, "awaiting-execution", checklist);
+    await ensureArchitectureVectorIndex(ctx);
+    if (!isCurrentWorkflow(workflowId)) return false;
+
     persistWorkflowState(piApi, "quick-goal-started");
 
     const modelSelected = await selectModel(
@@ -2893,14 +3242,10 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       "코드",
     );
     if (!modelSelected) {
-      state.autoMode = false;
-      state.autoReview = true;
-      state.reviewStage = "idle";
-      state.checklist = null;
-      state.workflowId = null;
-      persistWorkflowState(piApi, "quick-goal-model-failed");
+      releaseWorkflowIfCurrent(piApi, workflowId, "quick-goal-model-failed");
       return false;
     }
+    if (!isCurrentWorkflow(workflowId)) return false;
 
     ctx.ui.notify(
       "loop-agent: 작은 작업을 직접 실행합니다. 계획/인터뷰 없이 코드 에이전트를 시작합니다.",
@@ -2917,8 +3262,10 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     objective: string,
     autoReview = true,
   ): Promise<void> {
-    const prompt = await prepareGoalPipeline(ctx, objective, { autoReview });
-    if (prompt) piApi.sendUserMessage(prompt);
+    const preparation = await prepareGoalPipeline(ctx, objective, { autoReview });
+    if (preparation && "prompt" in preparation) {
+      piApi.sendUserMessage(preparation.prompt);
+    }
   }
 
   // 첫 메시지 자동 진입과 /easy-goal 명령이 같은 모드 판별(quick/direct/plan)을
@@ -2943,12 +3290,13 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       if (started) return { handled: true };
     }
 
-    const prompt = await prepareGoalPipeline(ctx, objective, {
+    const preparation = await prepareGoalPipeline(ctx, objective, {
       explicit,
       autoReview: false,
     });
-    if (!prompt) return { handled: false };
-    return { handled: true, prompt };
+    if (!preparation) return { handled: false };
+    if ("blocked" in preparation) return { handled: true };
+    return { handled: true, prompt: preparation.prompt };
   }
 
   async function startEasyGoalWorkflow(
@@ -2989,8 +3337,8 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       return { action: "continue" };
     }
 
-    // 첫 메시지도 /easy-goal과 같은 스타터를 공유한다. 준비 실패(바쁨/이미 진행
-    // 중/전제 파일 누락) 시에만 원본을 그대로 통과시킨다.
+    // 첫 메시지도 /easy-goal과 같은 스타터를 공유한다. 바쁨/이미 진행 중/전제
+    // 파일 누락은 원본을 통과시키지만, 필수 semantic search 실패는 삼킨다.
     const result = await resolveEasyGoalWorkflow(pi, ctx, text, false);
     if (!result.handled) {
       return { action: "continue" };
@@ -3031,17 +3379,27 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     state.lengthContinueCount = 0;
 
     const planningResponse = getLastAssistantText(event);
+    const responseWorkflowId = extractWorkflowId(planningResponse);
     const latestChecklist = extractChecklist(planningResponse);
+    const currentWorkflowId = state.workflowId;
+
+    // workflow 마커가 있다는 것은 최종 계획 응답을 뜻하므로 체크리스트가
+    // 누락된 경우에도 먼저 세대 검사를 적용한다. 오래된 최종 응답이 현재
+    // 목표를 실패 상태로 덮어쓰면 안 된다.
+    if (responseWorkflowId && responseWorkflowId !== currentWorkflowId) {
+      pi.appendEntry("loop-agent-workflow-rejected", {
+        reason: "stale-checklist",
+        responseWorkflowId,
+        currentWorkflowId,
+      });
+      ctx.ui.notify(
+        `loop-agent: 취소되거나 교체된 목표의 계획 응답을 무시했습니다 (응답=${responseWorkflowId}, 현재=${currentWorkflowId ?? "없음"}).`,
+        "warning",
+      );
+      return;
+    }
 
     if (latestChecklist) {
-      const responseWorkflowId = extractWorkflowId(planningResponse);
-      if (responseWorkflowId && responseWorkflowId !== state.workflowId) {
-        ctx.ui.notify(
-          "loop-agent: 취소되거나 교체된 목표의 체크리스트를 무시했습니다.",
-          "warning",
-        );
-        return;
-      }
       if (state.autoMode && !responseWorkflowId) {
         ctx.ui.notify(
           "loop-agent: 자동 목표 체크리스트에 워크플로 ID가 없어 실행을 중단합니다.",
@@ -3080,7 +3438,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
           "목표 체크리스트를 모두 만족하도록 코드를 수정하고 필요한 테스트를 실행하세요.",
           "작업을 중간에 멈추거나 사용자 승인을 다시 요청하지 말고, 완료 후 변경 내용과 검증 근거를 보고하세요.",
           "",
-          buildImplementSkillGuidance(),
+          buildImplementSkillGuidance(ctx.cwd),
           "",
           buildTaskTrackingInstructions(ctx.cwd),
           "",
@@ -3100,6 +3458,13 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
         "loop-agent: 목표 체크리스트를 저장했습니다. 다음 실행 완료 후 독립 검수를 시작합니다.",
         "info",
       );
+      return;
+    }
+
+    if (shouldWaitForPlanningInterview(state.autoMode, responseWorkflowId)) {
+      // 계획 프롬프트는 요구사항 인터뷰 중 질문만 출력하는 턴을 허용한다.
+      // workflow 마커가 없는 응답은 아직 최종 계획이 아니므로 자동 모드를
+      // 실패시키지 않고 다음 사용자 답변을 기다린다.
       return;
     }
 

@@ -4,8 +4,7 @@
 
 ## In progress
 
-<!-- backlog에서 착수한 T-### 블록이 여기로 이동한다. -->
-
+<!-- current 상태는 docs/issues.sqlite에 저장한다. 이 파일에는 이슈 블록을 이동하지 않는다. -->
 
 
 

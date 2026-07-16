@@ -4,9 +4,10 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const Database = require("better-sqlite3");
 
 const CLI = path.join(__dirname, "..", "scripts", "issue-store.js");
-const { parseArgs } = require(CLI);
+const { parseArgs, defaultEmbeddingPythonCandidates } = require(CLI);
 
 function runCli(cwd, ...args) {
   const result = spawnSync(process.execPath, [CLI, ...args], {
@@ -53,6 +54,16 @@ test("hyphenated CLI options map to the camelCase embedding and blocker fields",
   assert.equal(options.blockedBy, "T-100,T-101");
 });
 
+test("default embedding python lookup checks the installed agent venv", () => {
+  const root = path.join(os.tmpdir(), "target-project");
+  const scriptDirectory = path.join(os.homedir(), ".pi", "agent", "scripts");
+  const candidates = defaultEmbeddingPythonCandidates(root, scriptDirectory);
+
+  assert.ok(candidates.includes(path.join(root, ".venv", "bin", "python")));
+  assert.ok(candidates.includes(path.join(os.homedir(), ".pi", "agent", ".venv", "bin", "python")));
+  assert.equal(candidates.includes(path.join(scriptDirectory, ".venv", "bin", "python")), false);
+});
+
 test("init creates an idempotent sqlite-vector issue store schema", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "issue-store-init-"));
   fs.mkdirSync(path.join(root, "docs"), { recursive: true });
@@ -65,8 +76,106 @@ test("init creates an idempotent sqlite-vector issue store schema", () => {
   assert.equal(fs.existsSync(path.join(root, "docs", "issues.sqlite")), true);
   assert.match(first.vector.version, /^\d+\.\d+\.\d+$/);
   assert.equal(first.vector.dimension, 1024);
-  assert.deepEqual(first.schema, ["issues", "issue_blockers"]);
+  assert.deepEqual(first.schema, ["issues", "issue_blockers", "architecture_documents"]);
   assert.deepEqual(second.schema, first.schema);
+});
+
+test("indexes CONTEXT, top-level docs, and ADR sections separately", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "issue-store-architecture-"));
+  fs.mkdirSync(path.join(root, "docs", "adr"), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, "CONTEXT.md"),
+    "# Context\n\n## Source of truth\n\nSQLite is authoritative.\n",
+  );
+  fs.writeFileSync(
+    path.join(root, "docs", "architecture.md"),
+    "# Project architecture\n\n## Boundary\n\nThe worker owns background processing.\n",
+  );
+  fs.writeFileSync(
+    path.join(root, "docs", "adr", "0001-example.md"),
+    "# Example decision\n\n**Status:** accepted\n\n## Decision\n\nUse a local process boundary.\n",
+  );
+  const fake = path.join(root, "fake-embedding.js");
+  fs.writeFileSync(
+    fake,
+    "let input = '';\n" +
+      "process.stdin.on('data', (chunk) => { input += chunk; });\n" +
+      "process.stdin.on('end', () => {\n" +
+      "  const count = input.trim().split(/\\r?\\n/).filter(Boolean).length;\n" +
+      "  process.stdout.write(Array.from({ length: count }, () => JSON.stringify({ embedding: Array(1024).fill(0.25) })).join('\\n') + '\\n');\n" +
+      "});\n",
+  );
+  globalThis.issueStoreTestEnv = { ISSUE_EMBEDDING_COMMAND: `${process.execPath} ${fake}` };
+
+  assert.equal(fs.existsSync(path.join(root, "docs", "issues.sqlite")), false);
+  const indexed = runCli(root, "index-architecture");
+  const searched = runCli(root, "search-architecture", "source of truth", "--limit", "10");
+
+  delete globalThis.issueStoreTestEnv;
+  assert.equal(indexed.ok, true);
+  assert.equal(fs.existsSync(path.join(root, "docs", "issues.sqlite")), true);
+  assert.ok(indexed.document_count >= 6);
+  assert.equal(indexed.failed_count, 0);
+  assert.ok(searched.results.length > 0);
+  assert.ok(searched.results.every((document) =>
+    document.source_path === "CONTEXT.md" ||
+      document.source_path === "docs/architecture.md" ||
+      document.source_path.startsWith("docs/adr/"),
+  ));
+  assert.ok(searched.results.some((document) => document.doc_type === "context"));
+  assert.ok(searched.results.some((document) =>
+    document.source_path === "docs/architecture.md" && document.doc_type === "doc",
+  ));
+});
+
+test("upgrades the architecture index schema before indexing top-level docs", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "issue-store-architecture-upgrade-"));
+  fs.mkdirSync(path.join(root, "docs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, "docs", "architecture.md"),
+    "# Project architecture\n\n## Boundary\n\nThe worker owns background processing.\n",
+  );
+  const db = new Database(path.join(root, "docs", "issues.sqlite"));
+  db.exec(`
+    CREATE TABLE architecture_documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_path TEXT NOT NULL,
+      section_index INTEGER NOT NULL,
+      heading TEXT NOT NULL,
+      doc_type TEXT NOT NULL CHECK (doc_type IN ('context', 'adr')),
+      body TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      embedding BLOB,
+      embedding_status TEXT NOT NULL DEFAULT 'missing'
+        CHECK (embedding_status IN ('missing', 'ready', 'failed')),
+      embedding_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(source_path, section_index)
+    )
+  `);
+  db.close();
+
+  const fake = path.join(root, "fake-embedding.js");
+  fs.writeFileSync(
+    fake,
+    "let input = '';\n" +
+      "process.stdin.on('data', (chunk) => { input += chunk; });\n" +
+      "process.stdin.on('end', () => {\n" +
+      "  const count = input.trim().split(/\\r?\\n/).filter(Boolean).length;\n" +
+      "  process.stdout.write(Array.from({ length: count }, () => JSON.stringify({ embedding: Array(1024).fill(0.25) })).join('\\n') + '\\n');\n" +
+      "});\n",
+  );
+  globalThis.issueStoreTestEnv = { ISSUE_EMBEDDING_COMMAND: `${process.execPath} ${fake}` };
+
+  const indexed = runCli(root, "index-architecture");
+  const searched = runCli(root, "search-architecture", "worker boundary", "--limit", "10");
+
+  delete globalThis.issueStoreTestEnv;
+  assert.equal(indexed.ok, true);
+  assert.ok(searched.results.some((document) =>
+    document.source_path === "docs/architecture.md" && document.doc_type === "doc",
+  ));
 });
 
 test("migrate imports Markdown issue blocks once and preserves relationships", () => {
@@ -137,6 +246,7 @@ test("migrate imports Markdown issue blocks once and preserves relationships", (
   const list = runCli(root, "list");
   const created = runCli(root, "create", "--title", "Next issue", "--body", "Created body", "--label", "ready-for-agent");
   const child = runCli(root, "get", "T-101");
+  const pruned = runCli(root, "prune-migrated", "--yes");
 
   delete globalThis.issueStoreTestEnv;
   assert.equal(first.count, 3);
@@ -148,6 +258,12 @@ test("migrate imports Markdown issue blocks once and preserves relationships", (
   assert.match(child.issue.body, /The child body/);
   assert.equal(created.issue_id, "T-102");
   assert.equal(created.embedding_status, "ready");
+  assert.equal(pruned.issue_count, 3);
+  assert.ok(pruned.pruned_files.includes("docs/tasks/backlog.md"));
+  assert.doesNotMatch(
+    fs.readFileSync(path.join(root, "docs", "tasks", "backlog.md"), "utf8"),
+    /T-100/,
+  );
 });
 
 test("migrate fails before writing when any embedding fails", () => {

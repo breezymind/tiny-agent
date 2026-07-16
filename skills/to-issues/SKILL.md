@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 Break a plan into independently-grabbable issues using vertical slices (tracer bullets).
 
-The issue tracker and triage label vocabulary should have been provided to you — run `/setup-matt-pocock-skills` if not. Read the project's issue-tracker document and use `scripts/issue-store.js` as the only publishing interface.
+The issue tracker and triage label vocabulary should have been provided to you — run `/setup-matt-pocock-skills` if not. Read the project's issue-tracker document and use the installed agent `scripts/issue-store.js` CLI as the only publishing interface. Resolve the agent directory as `${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}` and pass the target project root with `--root`; do not require the target project to contain `scripts/issue-store.js`.
 
 ## Process
 
@@ -52,7 +52,7 @@ Iterate until the user approves the breakdown.
 
 ### 5. Publish the issues to the issue tracker
 
-For each approved slice, publish a new issue with `node scripts/issue-store.js create --json`, passing the issue body as stdin JSON (`title`, `label: ready-for-agent`, `status: backlog`, `parent`, `blockedBy`, and `body`). Do not append to `docs/tasks/*.md` directly. These issues are considered ready for AFK agents, so publish them with the correct triage label unless instructed otherwise.
+For each approved slice, publish a new issue with `AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"; node "$AGENT_DIR/scripts/issue-store.js" create --json --root "<project-root>"`, passing the issue body as stdin JSON (`title`, `label: ready-for-agent`, `status: backlog`, `parent`, `blockedBy`, and `body`). Do not append to `docs/tasks/*.md` directly. These issues are considered ready for AFK agents, so publish them with the correct triage label unless instructed otherwise.
 
 Publish issues in dependency order (blockers first) so you can reference real issue identifiers. Where the tracker supports it, link each slice to its parent as a native **sub-issue** and wire each blocker as a native **blocking edge** (mechanics in the issue-tracker doc); the `## Parent` and `## Blocked by` body sections are the fallback otherwise.
 
