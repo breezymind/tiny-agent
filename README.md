@@ -1,227 +1,147 @@
 # tiny-agent
 
-**[Pi 코딩 에이전트](https://github.com/earendil-works/pi-coding-agent) 기반의 커스텀 하네스(harness)입니다.**
-
-Pi 코어를 그대로 두고, 그 위에 전역 에이전트 규칙 · 확장(extension) · 스킬(skill) · 자동 계획
-워크플로우를 얹어 **계획 → 구현 → 테스트 → 리뷰**를 하나의 파이프라인으로 자동화하고,
-그래프 기반 코드 탐색을 강제하는 독자적인 에이전트 하네스로 재구성한 것입니다.
-
-즉, 범용 코딩 에이전트인 Pi를 다음과 같이 감싸(harness) 특정 작업 방식에 최적화합니다.
-
-- **행동 계층** — `AGENT.md`로 모든 세션의 판단·보고·검증 규칙을 고정
-- **오케스트레이션 계층** — `loop-agent` 확장이 한 턴의 입력을 다단계 계획·구현 루프로 승격
-- **탐색 계층** — `graph-gate` · `auto-index` 확장이 CodeGraph 우선 탐색을 강제·준비
-- **지식 계층** — `skills/`가 작업 유형별 전문 지침을 주입
-
-이 저장소는 `~/.pi/agent` 디렉토리에 위치하며, Pi 실행 시 위 계층이 자동으로 로드됩니다.
-
-## 반자동 파이프라인
-
-이 하네스의 핵심은 `loop-agent` 확장이 구현하는 **반자동(semi-automatic) 워크플로**입니다.
-계획은 사람과 함께 다듬고, 합의된 계획을 기계 판독 가능한 체크리스트로 고정한 뒤,
-그다음부터 구현·검증만 확장이 자동으로 돌립니다. 사람이 판단할 지점과 기계가 반복할
-지점을 명확히 나눈 것이 핵심입니다.
-
-```
-[사람과 함께] 계획 단계 (인터뷰 · 질의응답)
-  grill-with-docs → to-prd → to-issues → grill-checklist
-        │
-        ▼  기계 판독 체크리스트 생성
-────────────────────────────────────────────  ← 자동/수동 경계
-        │
-[확장이 자동] 실행 루프 (최대 maxImprovementRounds회 반복)
-  code
-   │
-   ├─ if to-issues marks parallel candidates and tasks are independent
-   │    code fan-out (snapshot A / snapshot B / ...)
-   │    └─ merge -> integration -> test -> review
-   │
-   └─ otherwise
-        implement -> test -> review
-                 │
-                 ▼  체크리스트 항목이 모두 통과할 때까지 실패 항목만 개선
-               완료
-
-/easy-goal  -> stop after test (fail = not completed)
-/hard-goal  -> continue through review loops
-```
-
-- **계획 단계는 수동** — `grill-with-docs`가 사람과 질문·답변을 주고받으며 모호함을 없애고,
-  ADR·용어집·PRD·이슈를 만든 뒤 `grill-checklist`로 검증 체크리스트를 확정합니다.
-- **경계** — 체크리스트가 기계 판독 경계 안에 생성되면 자동 실행으로 넘어갑니다.
-  일반 대화의 첫 메시지와 `/easy-goal`은 테스트 단계까지만 자동 실행하고, 테스트가 실패하면 완료로 처리하지 않습니다. `/hard-goal`은 계획 파이프라인 뒤 독립 검수 반복까지 이어집니다. 짧고 단일한 작업은 `direct` 경로를 탈 수 있습니다(`/easy-goal direct`, `/hard-goal direct`).
-- **실행 루프는 자동** — 코드 에이전트가 먼저 구현하고, 그 다음 테스트 에이전트와
-  독립 검수 에이전트가 가능한 구간에서는 병렬로 진행됩니다. 최종 판정은 체크리스트
-  검수와 테스트 결과를 함께 반영합니다. `to-issues`가 명시적으로 병렬 후보 마커를
-  남기고, 그 안에서 독립 `ready-for-agent` 서브태스크가 2개 이상 잡혔을 때만 코딩
-  단계도 임시 스냅샷으로 fan-out 하며, 자동 병합이 안전하지 않으면 즉시 단일 코딩
-  경로로 fallback 합니다.
-  실패 항목이 남으면 그 항목만
-  개선하며 `maxImprovementRounds`(기본 3)회까지 반복합니다.
-- **복구 가능** — 루프 상태를 세션 브랜치에 스냅샷으로 남겨 reload/resume 시 같은 지점에서
-  이어집니다.
-
-각 단계에 서로 다른 모델을 배정할 수 있습니다(`settings.json`의 `loopAgent`):
-계획·검증은 `claude-opus-4-8`, 코딩·테스트는 `claude-sonnet-5`처럼 단계별로 나눠 씁니다.
-
-### 계획 단계 산출물이 유지보수에 주는 영향
-
-계획 단계의 각 스킬은 대화만 진행하는 게 아니라 매번 파일·이슈트래커 산출물을 남깁니다.
-이 산출물이 세션이 끊기거나 사람이 바뀌어도 "왜/무엇을/언제 끝났다고 판단하는지"를
-재추론 없이 복원할 수 있게 해주는 것이 이 파이프라인의 실질적인 유지보수 효과입니다.
-
-- **`grill-with-docs`** — 한 번에 하나씩 질문·답변을 주고받아 모호함을 없애는 동시에
-  **ADR**과 **용어집**을 생성합니다. 결정의 이유가 대화 로그에만 남지 않고 `docs/`에
-  파일로 남아, 이후 이 코드를 만지는 사람(또는 에이전트)이 결정을 다시 추론하지 않고
-  ADR을 읽으면 됩니다. 용어집은 이후 PRD·이슈·코드에서 같은 단어를 같은 의미로 쓰도록
-  강제합니다.
-- **`to-prd`** — 인터뷰가 끝난 뒤 추가 질문 없이 대화 맥락만으로 PRD를 작성해
-  `docs/tasks/backlog.md`에 발행합니다. 합의된 범위(Problem/Solution/User Stories/
-  Implementation Decisions/Testing Decisions/Out of Scope)가 채팅 밖의 git으로
-  추적되는 파일로 고정되어, 세션이 압축·종료돼도 범위가 증발하지 않고 diff로 리뷰할
-  수 있는 산출물이 됩니다.
-- **`to-issues`** — PRD를 계층별이 아니라 끝단까지 관통하는 tracer-bullet 수직 슬라이스로
-  쪼개 `docs/tasks/backlog.md`에 발행합니다. 각 슬라이스는 독립적으로 데모·검증
-  가능하고 의존관계(`Blocked by`)가 명시되어, 나중에 문제가 생겼을 때 어느 슬라이스가
-  무엇을 바꿨는지 이슈 단위로 추적할 수 있습니다. 큰 PR 하나가 아니라 작고 완결된
-  단위로 히스토리가 쌓여 롤백·bisect·리뷰 단위가 작아집니다.
-- **`grill-checklist`** — 위 세 단계의 산출물(합의된 명세, ADR·용어집, PRD, 이슈)을
-  "정상 동작한다" 같은 비측정 표현 없이 검증 가능한 체크리스트로 변환합니다. 이 체크리스트가
-  이후 자동 `implement → test → review` 루프의 유일한 판정 기준이 되어, 루프가 반복되는
-  동안 범위가 슬금슬금 넓어지거나 좁아지는 걸 막는 앵커 역할을 합니다. 독립 검수 에이전트가
-  주관적 판단 대신 체크리스트 통과/실패로만 판정하므로, 나중에 "이 기능이 원래 뭘 하기로
-  했었지?"를 체크리스트만 보고 재구성할 수 있습니다.
-
-다만 이 구조는 코드를 짜기 전에 인터뷰·PRD·이슈 분해라는 오버헤드를 필요로 하고,
-`docs/tasks/backlog.md`·ADR·용어집 같은 산출물이 최신 상태로 유지되지 않으면 낡은 문서가
-오히려 혼란을 더할 수 있다는 대가가 있습니다.
-
-## 구성 요소
-
-### 에이전트 규칙 — `AGENT.md`
-
-모든 세션에 적용되는 전역 행동 규칙입니다. 요청 분류(질문/명령/혼합형), 최소 변경 원칙,
-그래프 우선 코드 탐색, 컨텍스트 관리, 검증, 중단·질문 조건 등을 정의합니다.
-모든 보고는 한국어로 합니다.
-
-### 확장 — `extensions/`
-
-Pi에 기능을 더하는 TypeScript 확장입니다.
-
-- **`loop-agent.ts`** — 위 "반자동 파이프라인"을 구현하는 확장입니다.
-- **`graph-gate.ts`** — grep/read 같은 원시 검색보다 CodeGraph 도구를 먼저 쓰도록 강제하는
-  그래프 우선 게이트입니다. 인덱스가 있을 때만 작동하며 `/graph-gate` 명령으로 모드를 바꿉니다.
-- **`auto-index.ts`** — 신규 프로젝트를 자동으로 CodeGraph 인덱싱합니다.
-  여러 세션이 동시에 인덱싱하지 않도록 lock 파일로 조율합니다.
-- **`lib/graph-status.ts`** — 그래프 상태 조회 공통 로직 (게이트·인덱서 공유).
-
-### 스킬 — `skills/`
-
-파이프라인 각 단계(계획/구현/리뷰/테스트)에 특화된 지침 모음입니다. 주요 스킬:
-
-| 분류 | 스킬 |
-| --- | --- |
-| 계획 | `grill-with-docs`, `grill-checklist`, `grilling`, `to-prd`, `to-issues`, `domain-modeling` |
-| 구현 | `implement`, `tdd` |
-| 리뷰 | `code-review` |
-| 테스트 | `frontend-testing`, `e2e-tester` |
-
-그 외 스택별·리서치용 스킬은 `skills/` 디렉토리를 참고하세요.
-
-### 설정 파일
-
-- **`settings.json`** — 기본 프로바이더/모델, `loopAgent` 단계별 모델(계획·코딩·검증·테스트) 설정
-
-## 요구 사항
-
-- [Pi 코딩 에이전트](https://github.com/earendil-works/pi-coding-agent)
-- Node.js (확장 실행용)
-- [CodeGraph](https://www.npmjs.com/package/@colbymchenry/codegraph) — 그래프 기반 코드 탐색
-- LiteLLM 프로바이더 (`settings.json` 기본값)
+Pi 코딩 에이전트 위에 `loop-agent` 확장과 스킬을 추가하는 커스텀 하네스입니다.
+계획 인터뷰부터 구현·테스트·리뷰까지를 연결하고, PRD와 이슈를 SQL VectorDB에서 관리합니다.
 
 ## 설치
 
-먼저 하네스가 얹힐 Pi 코어를 설치합니다.
+### Pi 패키지 설치
+
+`tiny-agent`는 Pi 확장 여러 개와 스킬을 묶은 Pi 패키지입니다. 사용자 런타임 홈인
+`~/.pi/agent`에 저장소를 직접 clone하지 말고 Pi 패키지 매니저로 설치합니다.
 
 ```bash
 npm install -g @earendil-works/pi-coding-agent
-```
-
-이후 용도에 따라 두 가지 방식 중 하나를 선택합니다.
-
-### 방식 A — 확장·스킬만 추가 (`pi install`, 권장)
-
-기존 Pi 환경에 tiny-agent의 **확장과 스킬만** 얹고 싶을 때 사용합니다.
-Pi가 저장소를 받아 `extensions/`, `skills/` 디렉토리를 자동 발견해 등록합니다.
-
-```bash
 pi install git:github.com/breezymind/tiny-agent
-pi install npm:@capyup/pi-basic-tools
+pi list
 ```
 
-- 전역이 아닌 특정 프로젝트에만 설치하려면 `-l`(`--local`)을 붙입니다.
-- 설치·제거·목록은 `pi list`, `pi remove <source>`, `pi update`로 관리합니다.
-- `npm:@capyup/pi-basic-tools`는 기본 편집·운영 보조 도구 묶음입니다.
+`pi install`은 패키지를 `~/.pi/agent/git/` 아래에 받고, 패키지 의존성을 설치하며,
+전역 `~/.pi/agent/settings.json`에 패키지 소스를 등록합니다. `auth.json`, `settings.json`,
+세션과 MCP 설정은 사용자 런타임 홈에 계속 남습니다.
 
-> **참고:** `pi install`은 확장·스킬 **리소스만** 등록합니다.
-> `AGENT.md`(전역 규칙), `settings.json`의 `loopAgent` 모델 구성, `mcp.json` 같은
-> agent home 레벨 설정은 포함되지 않으므로, 반자동 파이프라인까지 그대로 쓰려면 방식 B를 사용합니다.
-
-### 방식 B — agent home 전체 재현 (클론)
-
-전역 규칙·파이프라인·모델 구성까지 이 하네스를 **그대로 복제**하려면
-저장소를 Pi의 agent home 위치에 클론합니다.
+### 로컬 개발
 
 ```bash
-git clone https://github.com/breezymind/tiny-agent.git ~/.pi/agent
-cd ~/.pi/agent/npm && npm install   # 확장 실행에 필요한 npm 의존성
+git clone https://github.com/breezymind/tiny-agent.git ~/Workspace/tiny-agent
+cd ~/Workspace/tiny-agent
+npm install
+pi install ~/Workspace/tiny-agent
 ```
 
-### 로컬 전용 파일 구성 (공통)
+이미 저장소를 `~/.pi/agent`에 clone해 사용 중이라면, 먼저 작업 내용을 별도 저장소 위치로
+옮긴 뒤 `pi install git:github.com/breezymind/tiny-agent`로 전환합니다.
 
-`.gitignore`로 제외된 민감·로컬 파일은 커밋되지 않으므로 직접 준비해야 합니다.
+필요한 로컬 설정:
 
-- **`auth.json`** — 프로바이더 인증 토큰
-- **CodeGraph 설치** (그래프 탐색·게이트에 필요)
-
-  ```bash
-  npm install -g @colbymchenry/codegraph
-  ```
-
-- **`mcp.json`** — MCP 서버 설정. 로컬 절대경로가 포함되므로 환경에 맞게 작성합니다.
-
-  ```json
-  {
-    "mcpServers": {
-      "codegraph": {
-        "command": "node",
-        "args": ["<codegraph 설치 경로>/npm-shim.js", "serve", "--mcp"],
-        "directTools": true
-      }
-    }
-  }
-  ```
-
-### 편집 규칙
-
-파일을 수정할 때는 `bash`로 직접 덮어쓰지 말고 `apply_patch`를 기본 도구로 사용합니다.
-`bash`는 탐색, 검증, 빌드, 포맷팅 같은 실행 용도로만 씁니다.
-
-### 실행
+- `auth.json`: 프로바이더 인증 정보
+- `settings.json`: 모델과 `loopAgent` 단계별 설정
+- CodeGraph MCP: 그래프 기반 코드 탐색에 필요
 
 ```bash
-cd <작업할 프로젝트>
-pi
+npm install -g @colbymchenry/codegraph
 ```
 
-Pi를 실행하면 확장과 스킬이 로드되고(방식 B는 `AGENT.md` 전역 규칙까지),
-신규 프로젝트는 `auto-index`가 백그라운드에서 CodeGraph 인덱싱을 시작합니다.
+### 임베딩 모델
 
-## 보안
+이슈·PRD 검색에는 로컬 Python `sentence-transformers`와 `BAAI/bge-m3`를 사용합니다.
+Python이 uv로 관리되는 환경에서는 전역 `pip install` 대신 프로젝트 가상환경을 사용합니다.
 
-`.gitignore`가 다음을 커밋 대상에서 제외합니다.
+```bash
+uv venv .venv
+uv pip install --python .venv/bin/python sentence-transformers
+export ISSUE_EMBEDDING_MODEL=BAAI/bge-m3
+export ISSUE_EMBEDDING_COMMAND=".venv/bin/python scripts/issue-embedding.py"
 
-- 자격증명·토큰: `auth.json`, `litellm-models.json`, `*.key`, `*.pem`, `.env*`
-- 개인정보: `sessions/`(대화 기록), `mcp.json`(로컬 절대경로)
-- 캐시·생성물: `mcp-cache.json`, `.auto-index/`, `.codegraph/`
-- 의존성·바이너리: `node_modules/`, `bin/`
+# 최초 한 번만: Hugging Face에서 로컬 캐시로 모델 다운로드
+ISSUE_EMBEDDING_OFFLINE=0 .venv/bin/python -c \
+  'from sentence_transformers import SentenceTransformer; SentenceTransformer("BAAI/bge-m3")'
+```
+
+실행 시 임베딩은 기본적으로 `~/.cache/huggingface`의 로컬 캐시만 사용하며 네트워크에 접속하지 않습니다.
+모델이 캐시에 없으면 마이그레이션이 실패하므로 위 다운로드를 먼저 실행해야 합니다.
+로컬 모델 디렉터리를 직접 지정하려면 `ISSUE_EMBEDDING_MODEL=/path/to/bge-m3`를 사용합니다.
+온라인 다운로드를 다시 허용하려면 `ISSUE_EMBEDDING_OFFLINE=0`을 지정합니다.
+Pi의 자동 마이그레이션은 `~/.pi/agent/.venv/bin/python`을 우선 사용합니다. 다른 Python을 써야 하면
+`ISSUE_EMBEDDING_PYTHON`을 지정할 수 있습니다. Windows는 `.venv/bin/python` 대신
+`.venv\\Scripts\\python.exe`를 지정합니다.
+
+## `loop-agent` 확장
+
+`extensions/loop-agent.ts`는 사람과 계획을 확정한 뒤 나머지 실행을 자동화합니다.
+`graph-gate`와 `auto-index`는 CodeGraph 우선 탐색과 인덱싱을 담당하고, `skills/`는 각 단계의 지침을 제공합니다.
+
+## 반자동 파이프라인
+
+계획 단계는 사람과 함께 진행하고, 체크리스트가 확정된 뒤 실행 단계가 자동으로 시작됩니다.
+
+```text
+인터뷰
+  grill-with-docs → to-prd → to-issues → grill-checklist
+                                      │
+                              목표 체크리스트
+                                      │
+구현 → 테스트 → 독립 리뷰 → 실패 항목 개선 반복
+```
+
+- `grill-with-docs`: 모호한 요구사항을 한 번에 하나씩 질문하고 ADR·용어집을 기록합니다.
+- `to-prd`: 합의된 대화를 PRD로 정리해 이슈 저장소에 발행합니다.
+- `to-issues`: PRD를 독립적인 수직 슬라이스 `T-###` 이슈로 분해합니다.
+- `grill-checklist`: 구현과 검증에 사용할 측정 가능한 목표 체크리스트를 만듭니다.
+- 구현 후 테스트와 독립 리뷰가 체크리스트를 검증하고, 실패한 항목만 개선합니다.
+
+## SQL VectorDB 이슈 저장소
+
+이슈 트래커의 source of truth는 프로젝트 로컬 `docs/issues.sqlite`입니다.
+Node.js의 `better-sqlite3`로 SQLite를 열고 `@sqliteai/sqlite-vector` 확장을 로드해 PRD·이슈 본문을
+1024차원 `embedding BLOB`로 저장합니다.
+
+기존 `T-###` 식별자, `backlog/current/done` 상태, parent·blockedBy 관계를 유지합니다.
+기존 `docs/tasks/*.md`는 최초 마이그레이션 입력으로만 사용하며, 이후 SQLite를 직접 사용합니다.
+Pi를 기존 프로젝트에서 시작했을 때 `docs/issues.sqlite`가 없고 레거시 `T-###` 문서가 발견되면,
+loop-agent가 마이그레이션 여부를 물어봅니다. 승인하면 자동으로 DB를 만들고 Markdown 이슈를 옮기며,
+거절해도 원본 문서는 보존됩니다.
+
+임베딩 상태는 다음 중 하나입니다.
+
+- `missing`: 아직 임베딩하지 않음
+- `ready`: 벡터 검색 가능
+- `failed`: 원문은 저장됐지만 임베딩에 실패함
+
+`search`는 `ready` 행만 대상으로 sqlite-vector의 `vector_full_scan`을 사용합니다.
+일반 이슈 발행은 임베딩 실패를 막지 않고 `failed`로 저장하지만, Markdown `migrate`는 하나라도 임베딩에 실패하면 SQLite 이슈를 쓰지 않고 실패합니다. 모델을 준비한 뒤 다시 실행해야 하며, 이미 저장된 이슈는 `reembed-failed`로 재시도할 수 있습니다.
+
+### 기존 프로젝트 마이그레이션
+
+기존 프로젝트 루트에서 실행하면 `docs/tasks/backlog.md`, `current.md`, `archive/*.md`를 읽어
+`docs/issues.sqlite`로 옮깁니다. `--root`를 사용하면 CLI를 다른 위치에서 실행할 수도 있습니다.
+
+```bash
+PROJECT=/path/to/existing-project
+node ~/.pi/agent/scripts/issue-store.js init --root "$PROJECT"
+node ~/.pi/agent/scripts/issue-store.js migrate --root "$PROJECT"
+node ~/.pi/agent/scripts/issue-store.js list --root "$PROJECT"
+```
+
+이 명령은 기존 `T-###`, label, status, body, Parent, Blocked by 관계를 보존합니다.
+같은 명령을 다시 실행해도 이미 존재하는 이슈는 건너뛰므로 중복되지 않습니다.
+
+### CLI
+
+`--json`은 JSON 문자열을 인자로 받지 않고 stdin에서 읽습니다.
+
+```bash
+# 이슈 생성·조회·상태 변경
+printf '%s\n' '{"title":"Example","body":"..."}' | node scripts/issue-store.js create --json
+node scripts/issue-store.js list
+node scripts/issue-store.js get T-001
+node scripts/issue-store.js update-status T-001 current
+
+# 벡터 검색과 임베딩 재시도
+node scripts/issue-store.js search "관련 이슈"
+node scripts/issue-store.js reembed-failed
+```
+
+에이전트와 스킬은 DB 스키마를 직접 조작하지 않고 `scripts/issue-store.js` CLI를 사용합니다.
+CLI는 기계 판독용 JSON을 stdout에, 임베딩·SQLite 읽기/쓰기 진행 로그를 stderr에 출력하므로 Pi 화면과 일반 터미널에서 과정을 확인할 수 있습니다.
+`docs/issues.sqlite`는 Git 추적 대상이며 WAL/SHM 임시 파일은 무시합니다.

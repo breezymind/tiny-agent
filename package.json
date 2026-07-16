@@ -6,8 +6,29 @@
     "pi-package"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/breezymind/tiny-agent.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "extensions",
+    "skills",
+    "scripts/ai.js",
+    "scripts/issue-embedding.py",
+    "scripts/issue-store.js",
+    "templates",
+    "README.md",
+    "package.json",
+    "package-lock.json"
+  ],
   "bin": {
     "ai": "./scripts/ai.js"
+  },
+  "scripts": {
+    "test": "node --test"
   },
   "pi": {
     "extensions": [
@@ -15,6 +36,13 @@
       "extensions/bash-timeout.ts",
       "extensions/graph-gate.ts",
       "extensions/loop-agent.ts"
+    ],
+    "skills": [
+      "skills"
     ]
+  },
+  "dependencies": {
+    "@sqliteai/sqlite-vector": "^1.0.0",
+    "better-sqlite3": "^12.11.1"
   }
 }

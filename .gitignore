@@ -22,9 +22,16 @@ litellm-models.json
 # ─────────────────────────────────────────────
 # 세션 대화 기록 (개인 프로젝트 경로/사용자명/내용 포함)
 sessions/
+
+# Local Pi package fetch/cache state
+.pi/
 # 로컬 절대경로·사용자명이 박힌 MCP 설정
 mcp.json
 .claude/settings.local.json
+
+docs/issues.sqlite-wal
+docs/issues.sqlite-shm
+docs/issues.sqlite
 
 # ─────────────────────────────────────────────
 # 캐시 / 생성물 (재생성 가능)
@@ -40,6 +47,8 @@ mcp-cache.json
 node_modules/
 bin/
 *.log
+**/__pycache__/
+*.pyc
 
 # ─────────────────────────────────────────────
 # OS / 에디터 잡파일
@@ -53,3 +62,4 @@ Thumbs.db
 .vscode/
 
 settings.local.json
+.venv/

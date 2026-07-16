@@ -1,36 +1,31 @@
-# Issue Tracker
+# SQLite-vector Issue Tracker
 
-이 프로젝트의 이슈 트래커는 외부 서비스가 아니라 로컬 파일 트리다.
-to-prd·to-issues·코딩 에이전트는 아래 규약만 사용하고 외부 트래커 CLI나 MCP를
-가정하지 않는다.
+이 프로젝트의 source of truth는 Git에 추적되는 `docs/issues.sqlite`다. Markdown 파일 트리는 기존 이슈의 최초 `migrate` 입력으로만 사용하며, 이후 이슈 발행·조회·검색·상태 전이는 `scripts/issue-store.js` CLI를 통해 수행한다. Markdown에 이슈를 직접 append하거나 SQLite를 직접 조작하지 않는다.
 
-## 파일 트리
+- 식별자는 `T-###`, 상태는 `backlog|current|done`이다.
+- triage label은 `triage_label`, 부모는 `parent_issue_id`, 선행 이슈는 `blockedBy` 관계로 저장한다.
+- PRD는 별도 엔티티가 아니라 `(PRD)` 부모 이슈의 `body` 문서다.
+- `body`는 임베딩 실패와 관계없이 저장되며 `embedding_status`는 `missing|ready|failed`다.
+- 로컬 Python `sentence-transformers`의 `BAAI/bge-m3`가 1024차원 `embedding BLOB`를 생성한다. 실행 시 기본적으로 `~/.cache/huggingface`의 로컬 모델만 사용하며, 모델이 없으면 먼저 온라인으로 다운로드해야 한다. 자동 마이그레이션은 설치 폴더의 `.venv/bin/python`을 우선 사용하며, 다른 인터프리터는 `ISSUE_EMBEDDING_PYTHON`으로 지정할 수 있다. `search`는 ready 문서만 검색한다.
 
-- `docs/tasks/backlog.md` — 앞으로 할 큰 태스크. append-only로 관리한다.
-- `docs/tasks/current.md` — 지금 착수한 태스크(## In progress).
-- `docs/tasks/archive/<YYYY-MM>.md` — 완료된 태스크(## Done). 월별 파일.
-- `docs/changes/<YYYY-MM>.md` — 큰 태스크가 아닌 부수 변경 로그.
+최초 전환:
 
-## 이슈 식별자
+```sh
+node scripts/issue-store.js init
+node scripts/issue-store.js migrate
+```
 
-- 각 이슈는 `T-###`(0으로 채운 3자리 일련번호)로 식별한다. 번호는 backlog에
-  발행되는 순서대로 단조 증가하며 재사용하지 않는다.
-- 제목 줄 형식: `### T-### [triage-label] 제목`
-- 각 이슈 블록 첫 줄에 `**Status:**`(backlog | in-progress | done)를 둔다.
+`migrate`는 모든 신규 이슈의 임베딩을 먼저 검증하며, 하나라도 실패하면 SQLite 이슈를 쓰지 않고 실패한다. 성공한 경우에만 상태와 관계를 보존해 저장한다. Pi를 시작할 때 `docs/issues.sqlite`가 없고 레거시 `T-###` 문서가 있으면 loop-agent가 마이그레이션 여부를 묻고, 승인한 경우에만 이 명령을 자동 실행한다. 거절해도 원본 Markdown은 유지된다.
 
-## 상태 이동 규약
+CLI는 기계 판독용 한 줄 JSON을 stdout에, 임베딩·SQLite 읽기/쓰기 진행 로그를 stderr에 출력한다. 기본 DB는 `docs/issues.sqlite`이며 `--db`/`ISSUE_STORE_DB_PATH`로 바꿀 수 있다. 테스트 fake 임베딩은 `ISSUE_EMBEDDING_COMMAND`로 주입한다.
 
-1. 착수: backlog.md `## Backlog`의 T-### 블록을 잘라내 current.md
-   `## In progress`로 옮기고 Status를 in-progress로 바꾼다.
-2. 완료: 수용 기준을 모두 만족하면 current.md의 블록을 잘라내
-   archive/<YYYY-MM>.md `## Done`으로 옮기고 Status를 done으로 바꾼다.
-   블록 내용은 지우지 말고 이동만 한다(감사 추적).
-3. 사소한 변경: 큰 태스크가 아닌 변경은 changes/<YYYY-MM>.md에
-   `- <YYYY-MM>-DD: 요약 (관련 T-### 있으면 참조)` 형태로 append한다.
+```sh
+node scripts/issue-store.js create --title "새 이슈" --label ready-for-agent --body "구현 내용"
+node scripts/issue-store.js update-status T-001 current
+node scripts/issue-store.js get T-001
+node scripts/issue-store.js list --status backlog --label ready-for-agent
+node scripts/issue-store.js search "관련 문서" --limit 10
+node scripts/issue-store.js reembed-failed
+```
 
-## 부모·의존 관계
-
-- 이 파일 트리는 네이티브 sub-issue/blocking edge를 지원하지 않는다.
-- 부모 이슈는 블록 안 `## Parent` 섹션에 `- T-###`로, 선행 이슈는
-  `## Blocked by` 섹션에 `- T-###`로 참조한다. 없으면
-  `- None - can start immediately`.
+`create --json`는 stdin JSON(`title`, `body`, `label`/`triage_label`, `status`, `parent`, `blockedBy`)을 받는다. `docs/issues.sqlite-wal`과 `docs/issues.sqlite-shm`은 Git에서 제외하고 DB 본체는 추적한다.

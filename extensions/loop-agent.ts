@@ -5,11 +5,15 @@ import type {
   SessionCompactEvent,
   SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
+import {
+  chooseParallelCodingTasksFromIssues as selectParallelCodingTasksFromIssues,
+} from "./lib/issue-task-selection.js";
 
 // loop-agent: 새 세션의 첫 메시지 또는 /hard-goal을 자동 계획 파이프라인으로 감싸
 // 하나의 턴에서 grill-with-docs → to-prd → to-issues → grill-checklist
@@ -47,23 +51,34 @@ const TEST_RESULT_END = "<!-- loop-agent-test-result:end -->";
 const PARALLEL_TASKS_START = "<!-- loop-agent-parallel-tasks:start -->";
 const PARALLEL_TASKS_END = "<!-- loop-agent-parallel-tasks:end -->";
 const REVIEW_TIMEOUT_MS = 10 * 60 * 1000;
-const CODING_TIMEOUT_MS = 30 * 60 * 1000;
 const TEST_TIMEOUT_MS = 15 * 60 * 1000;
 const REVIEW_FORMAT_RETRIES = 2;
 const MAX_PARALLEL_CODING_TASKS = 4;
+const AGENT_DIR =
+  process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
+const PACKAGE_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
+const PACKAGE_SKILLS_DIR = path.join(PACKAGE_ROOT, "skills");
+const AGENT_SKILLS_DIR = path.join(AGENT_DIR, "skills");
+// 설치된 Pi 패키지에서는 패키지 내부 스킬을 우선 사용하고, 단일 확장으로
+// 로드하는 개발/호환 경로에서는 기존 전역 agent 홈을 fallback으로 사용한다.
+const SKILLS_DIR = fs.existsSync(PACKAGE_SKILLS_DIR)
+  ? PACKAGE_SKILLS_DIR
+  : AGENT_SKILLS_DIR;
 const CONFIG_PATH = path.join(
-  process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent"),
+  AGENT_DIR,
   "settings.json",
 );
 const CHECKLIST_SKILL_PATH = path.join(
-  path.dirname(CONFIG_PATH),
-  "skills",
+  SKILLS_DIR,
   SKILL_NAME,
   "SKILL.md",
 );
 
 function skillPath(skillName: string): string {
-  return path.join(path.dirname(CONFIG_PATH), "skills", skillName, "SKILL.md");
+  return path.join(SKILLS_DIR, skillName, "SKILL.md");
 }
 
 // to-prd/to-issues는 이 문서의 규약에 따라 이슈를 발행한다. 이 문서와 아래
@@ -73,43 +88,64 @@ function skillPath(skillName: string): string {
 // 프로젝트별 문서/태스크 경로 묶음. root는 에이전트 실행 cwd(ctx.cwd)다.
 type ProjectDocPaths = {
   issueTracker: string;
-  tasksBacklog: string;
-  tasksCurrent: string;
-  tasksArchiveDir: string;
   changesDir: string;
 };
 function projectDocPaths(root: string): ProjectDocPaths {
   const docs = path.join(root, "docs");
   return {
     issueTracker: path.join(docs, "agents", "issue-tracker.md"),
-    tasksBacklog: path.join(docs, "tasks", "backlog.md"),
-    tasksCurrent: path.join(docs, "tasks", "current.md"),
-    tasksArchiveDir: path.join(docs, "tasks", "archive"),
     changesDir: path.join(docs, "changes"),
   };
 }
 
+function issueStoreDatabasePath(root: string): string {
+  return path.join(root, "docs", "issues.sqlite");
+}
+
+function legacyMarkdownIssueFiles(root: string): string[] {
+  const tasks = path.join(root, "docs", "tasks");
+  const files: string[] = [];
+  for (const relative of ["backlog.md", "current.md"]) {
+    const filePath = path.join(tasks, relative);
+    if (fs.existsSync(filePath)) files.push(filePath);
+  }
+
+  const archive = path.join(tasks, "archive");
+  if (fs.existsSync(archive)) {
+    const walk = (directory: string): void => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const filePath = path.join(directory, entry.name);
+        if (entry.isDirectory()) walk(filePath);
+        else if (entry.isFile() && entry.name.endsWith(".md")) files.push(filePath);
+      }
+    };
+    walk(archive);
+  }
+  return files;
+}
+
+function hasLegacyMarkdownIssues(root: string): boolean {
+  return legacyMarkdownIssueFiles(root).some((filePath) => {
+    try {
+      return /^###\s+T-\d{3}\b/m.test(fs.readFileSync(filePath, "utf8"));
+    } catch {
+      return false;
+    }
+  });
+}
+
 // 새 프로젝트에는 docs 트리가 없다. 파이프라인이 요구하는 이슈 트래커 규약
-// 문서와 태스크 파일 트리를 프로젝트 루트에 자동 생성해, 빈 저장소에서도
-// /hard-goal·첫 메시지 파이프라인이 곧바로 성립하게 한다. 템플릿 원본은 코드에
-// 인라인하지 않고 에이전트 설치 폴더의 templates/docs/ 아래 실제 파일로 두어
+// 문서만 프로젝트 루트에 자동 생성해, 빈 저장소에서도 계획 파이프라인이
+// 곧바로 성립하게 한다. 템플릿 원본은 코드에 인라인하지 않고 에이전트 설치
+// 폴더의 templates/docs/ 아래 실제 파일로 두어
 // (스킬 본문을 파일로 주입하는 기존 관례와 동일) 콘텐츠와 코드를 분리한다.
-// 이 원본은 buildTaskTrackingInstructions가 강제하는 마커(## Backlog/
-// ## In progress/## Done, T-###, **Status:**)와 to-prd/to-issues 스킬의 이슈
-// 블록 형식에 정확히 일치해야 한다. 어긋나면 코딩 에이전트가 상태 파일을
-// 옮기지 못한다.
 const DOC_TEMPLATE_DIR = path.join(path.dirname(CONFIG_PATH), "templates", "docs");
 
-// 템플릿 원본(설치 폴더) → 프로젝트 대상 경로 매핑. archive/changes 디렉터리는
-// 코딩 에이전트가 완료·변경 시점에 월별 파일을 직접 만들므로 파일이 아닌 빈
-// 디렉터리만 확보한다.
+// 템플릿 원본(설치 폴더) → 프로젝트 대상 경로 매핑. 이슈 본문·상태는
+// SQLite/CLI가 소유하므로 docs/tasks Markdown 템플릿은 새 프로젝트에 만들지 않는다.
 function docTemplateFiles(root: string): Array<[string, string]> {
   const docs = projectDocPaths(root);
-  return [
-    [path.join(DOC_TEMPLATE_DIR, "agents", "issue-tracker.md"), docs.issueTracker],
-    [path.join(DOC_TEMPLATE_DIR, "tasks", "backlog.md"), docs.tasksBacklog],
-    [path.join(DOC_TEMPLATE_DIR, "tasks", "current.md"), docs.tasksCurrent],
-  ];
+  return [[path.join(DOC_TEMPLATE_DIR, "agents", "issue-tracker.md"), docs.issueTracker]];
 }
 
 // 프로젝트에 문서 트리가 없으면 설치 폴더의 원본 템플릿을 복사해 생성한다.
@@ -126,9 +162,7 @@ function ensureProjectDocs(root: string): string[] {
     created.push(target);
   }
   const docs = projectDocPaths(root);
-  for (const dir of [docs.tasksArchiveDir, docs.changesDir]) {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  }
+  if (!fs.existsSync(docs.changesDir)) fs.mkdirSync(docs.changesDir, { recursive: true });
   return created;
 }
 
@@ -141,23 +175,18 @@ function currentYearMonth(): string {
   return `${year}-${month}`;
 }
 
-// 코딩 에이전트(초기 실행·개선 라운드)에게 태스크 상태 파일 이동을
-// 강제하는 공통 지침. 파일 이동은 edit/write 도구를 가진 에이전트가
-// 수행해야 신뢰할 수 있으므로 확장이 직접 파싱하지 않고 지침을 주입한다.
+// 코딩 에이전트(초기 실행·개선 라운드)에게 SQLite 이슈 상태 전이를
+// 강제하는 공통 지침. 확장은 상태를 직접 바꾸지 않고 CLI 경계를 주입한다.
 function buildTaskTrackingInstructions(root: string): string {
   const month = currentYearMonth();
   const docs = projectDocPaths(root);
   return [
     "<task-tracking>",
-    `이 프로젝트의 이슈 트래커는 로컬 파일 트리다. 규약은 ${docs.issueTracker} 참조.`,
-    "작업 시작·진행·완료에 따라 아래 파일을 반드시 직접 수정하라(edit/write). 외부 트래커를 찾지 말라.",
+    `이 프로젝트의 이슈 트래커는 ${path.join(root, "docs", "issues.sqlite")}이며 규약은 ${docs.issueTracker} 참조.`,
+    `Markdown 태스크 파일을 source of truth로 읽거나 직접 수정하지 말고 ${path.join(root, "scripts", "issue-store.js")} CLI만 사용하라.`,
     "",
-    `1) 착수: 이번에 구현할 큰 태스크(T-###) 블록을 ${docs.tasksBacklog}의 ## Backlog에서 잘라내`,
-    `   ${docs.tasksCurrent}의 ## In progress로 옮기고 **Status:**를 in-progress로 바꿔라. 해당 태스크가`,
-    "   backlog에 아직 없다면(즉석 목표) current.md에 새 T-### 블록을 만들어 추가하라.",
-    `2) 완료: 모든 수용 기준을 만족하면 current.md의 해당 T-### 블록을 잘라내`,
-    `   ${path.join(docs.tasksArchiveDir, `${month}.md`)}의 ## Done으로 옮기고 **Status:**를 done으로 바꿔라.`,
-    "   블록 내용을 지우지 말고 이동만 하라(감사 추적). 아카이브 파일이 없으면 새로 생성하라.",
+    "1) 착수: 담당 T-###를 `node scripts/issue-store.js update-status T-### current`로 전이하라.",
+    "2) 완료: 모든 수용 기준을 만족하면 `node scripts/issue-store.js update-status T-### done`으로 전이하라.",
     `3) 사소한 변경: 큰 태스크가 아닌 부수 변경(오타·문구·리팩터·설정 등)은`,
     `   ${path.join(docs.changesDir, `${month}.md`)}에 "- ${month}-DD: 요약 (관련 T-### 있으면 참조)" 형태로 append하라.`,
     "</task-tracking>",
@@ -197,96 +226,235 @@ function buildDirectCodingPrompt(objective: string, root: string): {
   return { checklist, prompt };
 }
 
-function sectionBody(markdown: string, heading: string): string {
-  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(
-    `## ${escaped}\\n([\\s\\S]*?)(?=\\n## [^\\n]+\\n|$)`,
-    "i",
-  );
-  return markdown.match(pattern)?.[1]?.trim() ?? "";
+type IssueStoreRecord = {
+  issue_id?: unknown;
+  triage_label?: unknown;
+  label?: unknown;
+  title?: unknown;
+  status?: unknown;
+  parent?: unknown;
+  parent_issue_id?: unknown;
+  blockedBy?: unknown;
+  blocked_by?: unknown;
+  body?: unknown;
+  [key: string]: unknown;
+};
+
+function parseLastJsonObject(stdout: string): Record<string, unknown> | undefined {
+  for (const line of stdout.trim().split("\n").reverse()) {
+    try {
+      const value = JSON.parse(line) as unknown;
+      if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+        return value as Record<string, unknown>;
+      }
+    } catch {
+      // 진행 로그가 섞여도 JSON 객체 라인만 사용한다.
+    }
+  }
+  return undefined;
 }
 
-function extractTaskIdsFromSection(markdown: string, heading: string): string[] {
-  const body = sectionBody(markdown, heading);
-  return Array.from(body.matchAll(/-\s*(T-\d{3})\b/g)).map((match) => match[1]);
+function resolveBundledEmbeddingPython(): string {
+  const configured = process.env.ISSUE_EMBEDDING_PYTHON?.trim();
+  if (configured) return configured;
+
+  const agentRoot = path.dirname(CONFIG_PATH);
+  const candidates =
+    process.platform === "win32"
+      ? [path.join(agentRoot, ".venv", "Scripts", "python.exe")]
+      : [path.join(agentRoot, ".venv", "bin", "python")];
+  return candidates.find((candidate) => fs.existsSync(candidate)) ?? "python3";
 }
 
-function parseTaskBlocksFromFile(filePath: string): TaskBlock[] {
-  if (!fs.existsSync(filePath)) return [];
-  const text = fs.readFileSync(filePath, "utf8");
-  const headerPattern =
-    /^###\s+(T-\d{3})\s+(?:\[([^\]]+)\]\s+)?(.+?)\s*$/gm;
-  const headers = Array.from(text.matchAll(headerPattern));
-  const tasks: TaskBlock[] = [];
+type IssueStoreCliInvocation = {
+  cliPath: string;
+  cliArgs: string[];
+};
 
-  for (let index = 0; index < headers.length; index += 1) {
-    const match = headers[index];
-    const start = match.index ?? 0;
-    const end = headers[index + 1]?.index ?? text.length;
-    const raw = text.slice(start, end).trim();
-    const statusMatch = raw.match(/\*\*Status:\*\*\s*(backlog|in-progress|done)\b/i);
-    tasks.push({
-      id: match[1],
-      label: match[2] ?? null,
-      title: match[3].trim(),
-      status: (statusMatch?.[1]?.toLowerCase() as TaskBlock["status"]) ?? null,
-      parentIds: extractTaskIdsFromSection(raw, "Parent"),
-      blockedByIds: extractTaskIdsFromSection(raw, "Blocked by"),
-      raw,
-      sourcePath: filePath,
+function resolveIssueStoreCliInvocation(
+  root: string,
+  args: string[],
+): IssueStoreCliInvocation | undefined {
+  const projectCliPath = path.join(root, "scripts", "issue-store.js");
+  const bundledCliPath = path.join(path.dirname(CONFIG_PATH), "scripts", "issue-store.js");
+  const cliPath = fs.existsSync(projectCliPath)
+    ? projectCliPath
+    : fs.existsSync(bundledCliPath)
+      ? bundledCliPath
+      : undefined;
+  if (!cliPath) return undefined;
+
+  const cliArgs = [...args];
+  if (!cliArgs.includes("--root")) cliArgs.push("--root", root);
+  if (
+    cliPath === bundledCliPath &&
+    !process.env.ISSUE_EMBEDDING_COMMAND &&
+    !cliArgs.includes("--embedding-command")
+  ) {
+    const bundledEmbeddingPath = path.join(
+      path.dirname(CONFIG_PATH),
+      "scripts",
+      "issue-embedding.py",
+    );
+    if (fs.existsSync(bundledEmbeddingPath)) {
+      cliArgs.push(
+        "--embedding-command",
+        `${JSON.stringify(resolveBundledEmbeddingPython())} ${JSON.stringify(bundledEmbeddingPath)}`,
+      );
+    }
+  }
+
+  return { cliPath, cliArgs };
+}
+
+function runIssueStoreCli(
+  root: string,
+  args: string[],
+  onProgress?: (line: string) => void,
+): Record<string, unknown> | undefined {
+  const invocation = resolveIssueStoreCliInvocation(root, args);
+  if (!invocation) return undefined;
+
+  const result = spawnSync(process.execPath, [invocation.cliPath, ...invocation.cliArgs], {
+    cwd: root,
+    encoding: "utf8",
+    env: process.env,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  if (onProgress && typeof result.stderr === "string") {
+    for (const line of result.stderr.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)) {
+      onProgress(line);
+    }
+  }
+  if (result.status !== 0) return undefined;
+  return parseLastJsonObject(result.stdout);
+}
+
+function runIssueStoreCliAsync(
+  root: string,
+  args: string[],
+  onProgress?: (line: string) => void,
+): Promise<Record<string, unknown> | undefined> {
+  const invocation = resolveIssueStoreCliInvocation(root, args);
+  if (!invocation) return Promise.resolve(undefined);
+
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [invocation.cliPath, ...invocation.cliArgs], {
+      cwd: root,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
     });
+    let stdout = "";
+    let stderrBuffer = "";
+    let settled = false;
+
+    const consumeProgress = (chunk: unknown, flush = false): void => {
+      stderrBuffer += String(chunk ?? "");
+      const parts = stderrBuffer.split(/[\r\n]+/);
+      stderrBuffer = parts.pop() ?? "";
+      if (flush && stderrBuffer) {
+        parts.push(stderrBuffer);
+        stderrBuffer = "";
+      }
+      if (onProgress) {
+        for (const line of parts.map((value) => value.trim()).filter(Boolean)) {
+          onProgress(line);
+        }
+      }
+    };
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      stdout += String(chunk);
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      consumeProgress(chunk);
+    });
+    child.on("error", () => {
+      if (settled) return;
+      settled = true;
+      resolve(undefined);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      consumeProgress("", true);
+      resolve(code === 0 ? parseLastJsonObject(stdout) : undefined);
+    });
+  });
+}
+
+function loadIssueStoreRecords(
+  root: string,
+  onProgress?: (line: string) => void,
+): IssueStoreRecord[] {
+  if (!fs.existsSync(issueStoreDatabasePath(root))) return [];
+  const response = runIssueStoreCli(root, ["list"], onProgress);
+  return Array.isArray(response?.issues)
+    ? (response.issues as IssueStoreRecord[])
+    : [];
+}
+
+async function maybeMigrateLegacyIssueStore(ctx: ExtensionContext): Promise<void> {
+  const root = ctx.cwd;
+  if (fs.existsSync(issueStoreDatabasePath(root)) || !hasLegacyMarkdownIssues(root)) {
+    return;
   }
+  if (!ctx.hasUI) return;
 
-  return tasks;
-}
-
-function loadCandidateTasks(root: string): TaskBlock[] {
-  const docs = projectDocPaths(root);
-  return [
-    ...parseTaskBlocksFromFile(docs.tasksBacklog),
-    ...parseTaskBlocksFromFile(docs.tasksCurrent),
-  ];
-}
-
-function extractParallelTaskIds(text: string): string[] {
-  const start = text.indexOf(PARALLEL_TASKS_START);
-  const end = text.indexOf(PARALLEL_TASKS_END, start + PARALLEL_TASKS_START.length);
-  if (start < 0 || end < 0) return [];
-  return Array.from(
-    text
-      .slice(start + PARALLEL_TASKS_START.length, end)
-      .matchAll(/\bT-\d{3}\b/g),
-  ).map((match) => match[0]);
-}
-
-function chooseParallelCodingTasks(root: string, planningResponse: string): TaskBlock[] {
-  const allTasks = loadCandidateTasks(root);
-  const preferredIds = new Set(extractParallelTaskIds(planningResponse));
-  if (preferredIds.size === 0) return [];
-  const preferredTasks = allTasks.filter((task) => preferredIds.has(task.id));
-
-  const eligible = preferredTasks.filter(
-    (task) =>
-      task.label === "ready-for-agent" &&
-      task.status !== "done" &&
-      task.blockedByIds.length === 0,
+  const migrate = await ctx.ui.confirm(
+    "SQLite 이슈 저장소로 마이그레이션",
+    "기존 docs/tasks/*.md 이슈를 docs/issues.sqlite로 옮길까요? 원본 Markdown은 삭제하지 않습니다.",
   );
-  if (eligible.length < 2) return [];
-
-  const grouped = new Map<string, TaskBlock[]>();
-  for (const task of eligible) {
-    const parentKey = task.parentIds[0] ?? `__self__:${task.id}`;
-    const bucket = grouped.get(parentKey) ?? [];
-    bucket.push(task);
-    grouped.set(parentKey, bucket);
+  if (!migrate) {
+    ctx.ui.notify(
+      "loop-agent: Markdown 이슈를 마이그레이션하지 않았습니다. 다음 시작 때 다시 물어봅니다.",
+      "info",
+    );
+    return;
   }
 
-  const bestGroup = Array.from(grouped.values())
-    .filter((tasks) => tasks.length >= 2)
-    .sort((left, right) => right.length - left.length)[0];
-  if (!bestGroup) return [];
+  ctx.ui.notify(
+    "loop-agent: 기존 Markdown 이슈를 읽고 임베딩한 뒤 SQLite에 저장합니다.",
+    "info",
+  );
+  const result = await runIssueStoreCliAsync(root, ["migrate"], (line) => {
+    ctx.ui.notify(`loop-agent: ${line}`, "info");
+  });
+  if (result?.ok !== true) {
+    ctx.ui.notify(
+      "loop-agent: SQLite 이슈 저장소 마이그레이션에 실패했습니다. 원본 Markdown은 유지됩니다.",
+      "error",
+    );
+    return;
+  }
 
-  return bestGroup.slice(0, MAX_PARALLEL_CODING_TASKS);
+  const count = typeof result.count === "number" ? result.count : 0;
+  ctx.ui.notify(
+    `loop-agent: 기존 Markdown 이슈 ${count}개를 docs/issues.sqlite로 마이그레이션했습니다.`,
+    "info",
+  );
+}
+
+export function chooseParallelCodingTasksFromIssues(
+  records: IssueStoreRecord[],
+  planningResponse: string,
+): TaskBlock[] {
+  return selectParallelCodingTasksFromIssues(
+    records,
+    planningResponse,
+    MAX_PARALLEL_CODING_TASKS,
+  ) as TaskBlock[];
+}
+
+function chooseParallelCodingTasks(
+  root: string,
+  planningResponse: string,
+  onProgress?: (line: string) => void,
+): TaskBlock[] {
+  return chooseParallelCodingTasksFromIssues(
+    loadIssueStoreRecords(root, onProgress),
+    planningResponse,
+  );
 }
 
 function buildParallelTaskCodingPrompt(
@@ -1151,7 +1319,8 @@ async function runPiCommandWithProgress(
   ui: Pick<ExtensionContext["ui"], "setStatus">,
   label: string,
   args: string[],
-  timeoutMs: number,
+  timeoutMs?: number,
+  // undefined이면 자식 프로세스가 스스로 종료할 때까지 기다린다.
   // 부모 세션이 LLM 턴을 스트리밍하는 동안 sendMessage(triggerTurn:false)는
   // 표시·기록 대신 steer 큐로 들어가 사라진다(pi 코어 sendCustomMessage).
   // idle일 때만 진행 메시지를 보내고, 스트리밍 중엔 상태줄만 갱신한다.
@@ -1177,6 +1346,7 @@ async function runPiCommandWithProgress(
     let lastActivity = Date.now();
     let finished = false;
     let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
 
     const parse: EventParseState = {
       finalText: "",
@@ -1194,7 +1364,7 @@ async function runPiCommandWithProgress(
       finished = true;
       activeChildren.delete(child);
       clearInterval(heartbeat);
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
       clearStatus();
       resolve(result);
     };
@@ -1204,7 +1374,7 @@ async function runPiCommandWithProgress(
       finished = true;
       activeChildren.delete(child);
       clearInterval(heartbeat);
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
       clearStatus();
       reject(error);
     };
@@ -1298,12 +1468,14 @@ async function runPiCommandWithProgress(
       );
     }, 5000);
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 5000).unref();
-      setLoopAgentChildStatus(ui, label, "시간 초과, 종료 중");
-    }, timeoutMs);
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+        setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+        setLoopAgentChildStatus(ui, label, "시간 초과, 종료 중");
+      }, timeoutMs);
+    }
 
     child.stdout.on("data", (chunk: Buffer) => {
       ingestStdout(chunk.toString("utf8"));
@@ -1324,7 +1496,7 @@ async function runPiCommandWithProgress(
       if (timedOut) {
         fail(
           new Error(
-            `${label} 실행이 ${Math.floor(timeoutMs / 1000)}초 제한을 넘겨 종료되었습니다.`,
+            `${label} 실행이 ${Math.floor((timeoutMs ?? 0) / 1000)}초 제한을 넘겨 종료되었습니다.`,
           ),
         );
         return;
@@ -1968,7 +2140,9 @@ async function runParallelCodingPhase(
   checklist: string,
   planningResponse: string,
 ): Promise<string | null> {
-  const tasks = chooseParallelCodingTasks(ctx.cwd, planningResponse);
+  const tasks = chooseParallelCodingTasks(ctx.cwd, planningResponse, (line) => {
+    ctx.ui.notify(`loop-agent: ${line}`, "info");
+  });
   if (tasks.length < 2) return null;
 
   ctx.ui.notify(
@@ -2128,7 +2302,8 @@ async function runCodingAgent(
     ctx.ui,
     "코드 에이전트",
     args,
-    CODING_TIMEOUT_MS,
+    // 코드 에이전트는 긴 도구 실행을 허용하고 wall-clock 제한을 두지 않는다.
+    undefined,
     ctx.isIdle,
   );
   if (result.code !== 0) {
@@ -2533,6 +2708,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
   if (process.env.LOOP_AGENT_CHILD === "1") return;
 
   pi.on("session_start", async (event, ctx) => {
+    await maybeMigrateLegacyIssueStore(ctx);
     const freshSession = isFreshSessionStart(event);
     state.armed = state.enabled && freshSession;
 
@@ -2923,6 +3099,18 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       ctx.ui.notify(
         "loop-agent: 목표 체크리스트를 저장했습니다. 다음 실행 완료 후 독립 검수를 시작합니다.",
         "info",
+      );
+      return;
+    }
+
+    if (state.autoMode) {
+      state.reviewStage = "failed";
+      state.autoMode = false;
+      state.workflowId = null;
+      persistWorkflowState(pi, "checklist-marker-missing");
+      ctx.ui.notify(
+        "loop-agent: 구현계획 응답에서 grill-checklist 경계를 찾지 못해 자동 실행을 중단했습니다. 계획 모델이 지정된 체크리스트 경계를 출력했는지 확인하세요.",
+        "error",
       );
       return;
     }
