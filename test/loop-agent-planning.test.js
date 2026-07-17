@@ -108,3 +108,32 @@ test("planning prerequisite lookup and controller orchestration are dependency-i
     "notify:loop-agent: 반자동 목표 파이프라인(인터뷰 → to-prd → to-issues → checklist → 자동 구현·검증)을 시작합니다. 1단계 인터뷰는 질문/답변을 주고받습니다.",
   ]);
 });
+
+test("semantic search failure reports a block without consuming the source request", async () => {
+  const notifications = [];
+  const result = await preparePlanningPipeline(
+    {},
+    { cwd: "/project", ui: { notify: (message) => notifications.push(message) } },
+    "search failure",
+    { explicit: false, autoReview: false },
+    {
+      ensureWorkflowWorkspace: () => true,
+      findMissingPipelinePrerequisite: () => null,
+      reserveWorkflow: () => "workflow-search-failure",
+      runRequiredSemanticSearch: async () => null,
+      isCurrentWorkflow: () => true,
+      persistWorkflowState: () => {},
+      releaseWorkflowIfCurrent: () => {},
+      selectModel: async () => true,
+      workflowConfig: { planningModel: null, planningThinkingLevel: null },
+      buildPlanningPipelinePrompt: () => "unreachable",
+    },
+    { skillPath: () => "/skill.md", buildArchitectureReadGuidance: () => "arch" },
+  );
+
+  assert.deepEqual(result, {
+    blocked: true,
+    reason: "semantic-search-failed",
+  });
+  assert.deepEqual(notifications, []);
+});

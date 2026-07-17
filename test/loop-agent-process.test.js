@@ -69,3 +69,34 @@ test("injected Pi process runtime parses NDJSON and reports progress", async () 
   assert.equal(statuses.at(-1), undefined);
   assert.equal(runtime.killActiveChildren(), 0);
 });
+
+test("Pi process runtime terminates a timed-out child", async () => {
+  const killedSignals = [];
+  const runtime = createPiProcessRuntime({
+    registerExitHandler: false,
+    spawnProcess() {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = (signal) => {
+        killedSignals.push(signal);
+        process.nextTick(() => child.emit("close", null, signal));
+        return true;
+      };
+      return child;
+    },
+  });
+
+  await assert.rejects(
+    runtime.runPiCommandWithProgress(
+      { sendMessage: () => {} },
+      process.cwd(),
+      { setStatus: () => {} },
+      "timed-out Pi",
+      ["prompt"],
+      10,
+    ),
+    /제한을 넘겨 종료되었습니다/,
+  );
+  assert.deepEqual(killedSignals, ["SIGTERM"]);
+});

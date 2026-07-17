@@ -50,7 +50,7 @@ export type SemanticSearchContext = {
 
 export type GoalPipelinePreparation =
   | { prompt: string }
-  | { blocked: true }
+  | { blocked: true; reason: "semantic-search-failed" }
   | null;
 
 export type PlanningPromptDependencies = {
@@ -410,7 +410,7 @@ export async function preparePlanningPipeline(
   );
   if (!semanticContext) {
     dependencies.releaseWorkflowIfCurrent(pi, workflowId, "goal-search-failed");
-    return { blocked: true };
+    return { blocked: true, reason: "semantic-search-failed" };
   }
   if (!dependencies.isCurrentWorkflow(workflowId)) return null;
 

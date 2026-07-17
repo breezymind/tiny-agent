@@ -17,6 +17,8 @@ node "$AGENT_DIR/scripts/issue-store.js" update-status T-001 done --root "$PROJE
 node "$AGENT_DIR/scripts/issue-store.js" search "관련 이슈" --root "$PROJECT"
 ```
 
-아키텍처 문서는 `put-architecture`, `get-architecture`, `list-architecture`, `delete-architecture`, `search-architecture`로 관리한다. 부수 변경은 `record-change --summary "요약" --issue T-001`로 `change_log`에 기록한다.
+아키텍처 문서는 `put-document`, `put-context`, `put-adr`, `get-architecture`, `list-architecture`, `delete-architecture`, `search-architecture`로 관리한다. `put-document`·`put-context`·`put-adr`는 각각 `doc`·`context`·`adr` 유형을 고정해 SQLite에 저장한다. 부수 변경은 `record-change --summary "요약" --issue T-001`로 `change_log`에 기록한다.
+
+사용자가 어떤 문서를 저장하라고 해도 프로젝트 Markdown 파일을 생성·수정하지 않는다. PRD와 구현 이슈는 `create`/`get` CLI의 SQLite `body`에 저장하고, ADR·용어집·조사·설계 문서는 typed architecture CLI에 저장한다. 본문에 Markdown 문법을 쓰는 것은 가능하지만 저장 대상은 항상 SQLite record다.
 
 임베딩 실패 시에도 원문은 SQLite에 저장되며 `reembed-failed`로 재시도할 수 있다. SQLite를 직접 조작하지 않는다.

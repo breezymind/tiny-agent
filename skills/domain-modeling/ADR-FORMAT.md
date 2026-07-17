@@ -2,7 +2,7 @@
 
 ADRs are append-only records in the project's `architecture_documents` SQLite table with `doc_type=adr`. Use sequential logical keys such as `adr/0001-slug`, `adr/0002-slug`; these are record keys, not Markdown paths.
 
-Create a record lazily — only when the first ADR is needed. Use `put-architecture` and never modify the SQLite file directly.
+Create a record lazily — only when the first ADR is needed. Use the typed `put-adr` CLI command and never modify the SQLite file directly.
 
 ## Template
 
@@ -26,7 +26,20 @@ Only include these when they add genuine value. Most ADRs won't need them.
 
 ## Numbering
 
-Use `list-architecture` with `doc_type=adr` or the existing logical keys to find the highest number and increment by one.
+Use `list-architecture --doc-type adr` or the existing logical keys to find the highest number and increment by one. The `adr/<n>-<slug>` value is a logical SQLite key, not a path under `docs/adr/`.
+
+## Storage command
+
+```bash
+AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+node "$AGENT_DIR/scripts/issue-store.js" put-adr \
+  --source-path "adr/0001-example" \
+  --heading "Short title" \
+  --body "# Short title\n\nDecision and rationale." \
+  --root "$PROJECT"
+```
+
+Do not use `write`, `edit`, shell redirection, or `docs/adr/*.md` for a project ADR. The body can contain Markdown formatting; it is stored as text in SQLite.
 
 ## When to offer an ADR
 

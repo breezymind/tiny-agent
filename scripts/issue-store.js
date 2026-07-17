@@ -421,12 +421,44 @@ function putArchitectureDocument(store, options) {
   );
 }
 
+function putTypedArchitectureDocument(store, options, docType, command) {
+  const requestedType = options.doc_type || options.docType;
+  if (requestedType !== undefined && String(requestedType).trim() !== docType) {
+    throw new Error(`${command}는 doc_type=${docType}만 저장합니다.`);
+  }
+  return putArchitectureDocument(store, { ...options, doc_type: docType });
+}
+
+function putDocument(store, options) {
+  return putTypedArchitectureDocument(store, options, "doc", "put-document");
+}
+
+function putContextDocument(store, options) {
+  return putTypedArchitectureDocument(store, options, "context", "put-context");
+}
+
+function putAdrDocument(store, options) {
+  return putTypedArchitectureDocument(store, options, "adr", "put-adr");
+}
+
 function listArchitectureDocuments(store, options) {
-  const rows = options.source_path || options.sourcePath
-    ? store.db
-      .prepare("SELECT * FROM architecture_documents WHERE source_path = ? ORDER BY section_index")
-      .all(options.source_path || options.sourcePath)
-    : store.db.prepare("SELECT * FROM architecture_documents ORDER BY source_path, section_index").all();
+  const sourcePath = options.source_path || options.sourcePath;
+  const docType = options.doc_type || options.docType;
+  if (docType) validateDocumentType(String(docType).trim());
+  const clauses = [];
+  const values = [];
+  if (sourcePath) {
+    clauses.push("source_path = ?");
+    values.push(sourcePath);
+  }
+  if (docType) {
+    clauses.push("doc_type = ?");
+    values.push(String(docType).trim());
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const rows = store.db
+    .prepare(`SELECT * FROM architecture_documents ${where} ORDER BY source_path, section_index`)
+    .all(...values);
   return rows.map((row) => formatArchitectureDocument(row));
 }
 
@@ -844,7 +876,7 @@ function run(argv = process.argv.slice(2)) {
   let store;
   try {
     if (command === "help") {
-      print({ ok: true, commands: ["init", "create", "get", "list", "update-status", "search", "put-architecture", "get-architecture", "list-architecture", "delete-architecture", "search-architecture", "record-change", "list-changes", "reembed-failed"] });
+      print({ ok: true, commands: ["init", "create", "get", "list", "update-status", "search", "put-document", "put-context", "put-adr", "put-architecture", "get-architecture", "list-architecture", "delete-architecture", "search-architecture", "record-change", "list-changes", "reembed-failed"] });
       return;
     }
     store = openStore(dbPath);
@@ -886,6 +918,21 @@ function run(argv = process.argv.slice(2)) {
     }
     if (command === "put-architecture") {
       const document = putArchitectureDocument(store, options);
+      print({ ok: true, command, document });
+      return;
+    }
+    if (command === "put-document") {
+      const document = putDocument(store, options);
+      print({ ok: true, command, document });
+      return;
+    }
+    if (command === "put-context") {
+      const document = putContextDocument(store, options);
+      print({ ok: true, command, document });
+      return;
+    }
+    if (command === "put-adr") {
+      const document = putAdrDocument(store, options);
       print({ ok: true, command, document });
       return;
     }

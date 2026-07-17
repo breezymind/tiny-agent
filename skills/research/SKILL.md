@@ -8,6 +8,8 @@ Spin up a **background agent** to do the research, so you keep working while it 
 Its job:
 
 1. Investigate the question against **primary sources** — official docs, source code, specs, first-party APIs — not a secondary write-up of them. Follow every claim back to the source that owns it.
-2. Write the findings to one `architecture_documents` SQLite record with `doc_type=doc`, citing each claim's source in the body. Use the installed `scripts/issue-store.js put-architecture` CLI with `--root`.
+2. Write the findings to one `architecture_documents` SQLite record with `doc_type=doc`, citing each claim's source in the body. Use the installed `scripts/issue-store.js put-document` CLI with `--root`.
 3. Use a stable logical `source_path` such as `research/<slug>` and report that key so the findings can be retrieved with `get-architecture` or `search-architecture`.
 4. Do not create or update a Markdown findings file.
+
+The same SQLite-only rule applies to every research/design/reference document produced during the task: Markdown is allowed inside the SQLite `body`, but never as a project output file.

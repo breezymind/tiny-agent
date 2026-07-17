@@ -28,6 +28,8 @@ export type GateState = {
   armed: boolean;
   reviewStage: ReviewStage;
   checklist: string | null;
+  pendingCodingPrompt: string | null;
+  lastFailure: WorkflowFailure | null;
   improvementRound: number;
   autoMode: boolean;
   autoReview: boolean;
@@ -36,9 +38,27 @@ export type GateState = {
   lengthContinueCount: number;
 };
 
+export type WorkflowFailureItem = {
+  item: string;
+  reason: string;
+  evidence: string;
+};
+
+export type WorkflowFailure = {
+  source: "review" | "testing";
+  items: WorkflowFailureItem[];
+};
+
 export type PersistedWorkflowState = Pick<
   GateState,
-  "reviewStage" | "checklist" | "improvementRound" | "autoMode" | "autoReview" | "workflowId"
+  | "reviewStage"
+  | "checklist"
+  | "pendingCodingPrompt"
+  | "lastFailure"
+  | "improvementRound"
+  | "autoMode"
+  | "autoReview"
+  | "workflowId"
 >;
 
 export function createInitialGateState(): GateState {
@@ -47,6 +67,8 @@ export function createInitialGateState(): GateState {
     armed: false,
     reviewStage: "idle",
     checklist: null,
+    pendingCodingPrompt: null,
+    lastFailure: null,
     improvementRound: 0,
     autoMode: false,
     autoReview: true,
@@ -72,6 +94,8 @@ export function reserveWorkflow(
   state.autoReview = autoReview;
   state.reviewStage = reviewStage;
   state.checklist = checklist;
+  state.pendingCodingPrompt = null;
+  state.lastFailure = null;
   state.improvementRound = 0;
   state.workflowId = workflowId;
   state.processingWorkflowId = null;
@@ -81,6 +105,8 @@ export function reserveWorkflow(
 export function releaseWorkflow(state: GateState): void {
   state.reviewStage = "idle";
   state.checklist = null;
+  state.pendingCodingPrompt = null;
+  state.lastFailure = null;
   state.improvementRound = 0;
   state.autoMode = false;
   state.autoReview = true;
@@ -91,6 +117,8 @@ export function releaseWorkflow(state: GateState): void {
 export function resetForFreshSession(state: GateState): void {
   state.reviewStage = "idle";
   state.checklist = null;
+  state.pendingCodingPrompt = null;
+  state.lastFailure = null;
   state.improvementRound = 0;
   state.autoMode = false;
   state.autoReview = true;
@@ -117,6 +145,8 @@ export function markReviewing(state: GateState): void {
 
 export function completeWorkflow(state: GateState): void {
   state.reviewStage = "reviewed";
+  state.pendingCodingPrompt = null;
+  state.lastFailure = null;
   state.autoMode = false;
   state.autoReview = true;
   state.workflowId = null;
@@ -125,6 +155,7 @@ export function completeWorkflow(state: GateState): void {
 
 export function failWorkflow(state: GateState): void {
   state.reviewStage = "failed";
+  state.pendingCodingPrompt = null;
   state.autoMode = false;
   state.autoReview = true;
   state.workflowId = null;

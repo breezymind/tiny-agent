@@ -243,6 +243,27 @@ function withJsonMode(args: string[]): string[] {
   return ["--mode", "json", ...result];
 }
 
+function signalChild(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (process.platform !== "win32" && typeof child.pid === "number") {
+    try {
+      // Coding agents may spawn shells, MCP servers, or tool subprocesses. The
+      // detached child becomes its own process group so cancellation reaches
+      // the whole tree instead of only the direct `pi` process.
+      process.kill(-child.pid, signal);
+      return;
+    } catch {
+      // The group may already have exited; fall back to the direct child.
+    }
+  }
+  child.kill(signal);
+}
+
+function scheduleHardKill(child: ChildProcess): ReturnType<typeof setTimeout> {
+  const timer = setTimeout(() => signalChild(child, "SIGKILL"), 5000);
+  timer.unref();
+  return timer;
+}
+
 export function createPiProcessRuntime({
   spawnProcess = spawn,
   registerExitHandler = true,
@@ -280,7 +301,8 @@ export function createPiProcessRuntime({
   const killActiveChildren = (): number => {
     let killed = 0;
     for (const child of activeChildren) {
-      child.kill("SIGTERM");
+      signalChild(child, "SIGTERM");
+      scheduleHardKill(child);
       killed += 1;
     }
     activeChildren.clear();
@@ -310,6 +332,7 @@ export function createPiProcessRuntime({
         cwd,
         env: { ...process.env, LOOP_AGENT_CHILD: "1" },
         stdio: ["ignore", "pipe", "pipe"],
+        detached: process.platform !== "win32",
       });
       activeChildren.add(child);
 
@@ -321,6 +344,7 @@ export function createPiProcessRuntime({
       let finished = false;
       let timedOut = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
       let heartbeat: ReturnType<typeof setInterval> | undefined;
       const parse: EventParseState = {
         finalText: "",
@@ -336,6 +360,7 @@ export function createPiProcessRuntime({
         activeChildren.delete(child);
         if (heartbeat !== undefined) clearInterval(heartbeat);
         if (timer !== undefined) clearTimeout(timer);
+        if (killTimer !== undefined) clearTimeout(killTimer);
         clearStatus();
         resolve(result);
       };
@@ -345,6 +370,7 @@ export function createPiProcessRuntime({
         activeChildren.delete(child);
         if (heartbeat !== undefined) clearInterval(heartbeat);
         if (timer !== undefined) clearTimeout(timer);
+        if (killTimer !== undefined) clearTimeout(killTimer);
         clearStatus();
         reject(error);
       };
@@ -414,8 +440,8 @@ export function createPiProcessRuntime({
       if (timeoutMs !== undefined) {
         timer = setTimeout(() => {
           timedOut = true;
-          child.kill("SIGTERM");
-          setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+          signalChild(child, "SIGTERM");
+          killTimer = scheduleHardKill(child);
           setChildStatus(ui, label, "시간 초과, 종료 중");
         }, timeoutMs);
       }
@@ -428,7 +454,7 @@ export function createPiProcessRuntime({
       child.once("error", (error) => fail(error instanceof Error ? error : new Error(String(error))));
       child.once("close", (code, signal) => {
         if (timedOut) {
-          fail(new Error(`${label} 실행이 ${Math.floor((timeoutMs ?? 0) / 1000)}초 제한을 넘겨 종료되었습니다.`));
+          fail(new Error(`${label} 실행이 ${Math.ceil((timeoutMs ?? 0) / 1000)}초 제한을 넘겨 종료되었습니다.`));
           return;
         }
         const stdoutTail = stdoutRemainder.trim();

@@ -49,6 +49,7 @@ import {
   type PersistedWorkflowState,
   type ReviewStage,
   type ThinkingLevel,
+  type WorkflowFailure,
   type WorkflowConfig,
 } from "./lib/loop-agent-state.ts";
 import {
@@ -66,6 +67,10 @@ import {
   saveWorkflowConfig,
   THINKING_LEVELS,
 } from "./lib/loop-agent-config.ts";
+import {
+  withRolePersona,
+  type LoopAgentRole,
+} from "./lib/loop-agent-persona.ts";
 
 // loop-agent: 새 세션의 첫 메시지 또는 /hard-goal을 자동 계획 파이프라인으로 감싸
 // 하나의 턴에서 grill-with-docs → to-prd → to-issues → grill-checklist
@@ -95,6 +100,7 @@ const TEST_RESULT_START = "<!-- loop-agent-test-result:start -->";
 const TEST_RESULT_END = "<!-- loop-agent-test-result:end -->";
 const REVIEW_TIMEOUT_MS = 10 * 60 * 1000;
 const TEST_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_CODING_TIMEOUT_MS = 30 * 60 * 1000;
 const REVIEW_FORMAT_RETRIES = 2;
 const MAX_PARALLEL_CODING_TASKS = 4;
 const AGENT_DIR =
@@ -126,6 +132,13 @@ const CHECKLIST_SKILL_PATH = path.join(
 );
 const processRuntime = createPiProcessRuntime();
 
+function resolveCodingTimeoutMs(): number {
+  const configured = Number(process.env.PI_LOOP_AGENT_CODING_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_CODING_TIMEOUT_MS;
+}
+
 export type LoopAgentExecutionRuntime = {
   state: GateState;
   process: PiProcessRuntime;
@@ -137,12 +150,23 @@ function skillPath(skillName: string): string {
 }
 
 function buildArchitectureReadGuidance(root: string): string {
+  const adrCommand = issueStoreCliShellCommand(
+    root,
+    'put-adr --source-path "adr/<n>-<slug>" --heading "제목" --body "결정과 근거"',
+  );
+  const documentCommand = issueStoreCliShellCommand(
+    root,
+    'put-document --source-path "doc/<slug>" --heading "제목" --body "문서 본문"',
+  );
   return [
     "<architecture-search-gate>",
     "구현 계획을 확정하거나 코드를 수정하기 전에 SQLite의 `search-architecture` 결과를 반드시 참고하라.",
     "아키텍처 문서의 원문은 SQLite가 보유한 section 본문이며, 검색 결과와 `get-architecture`로 읽는다.",
     `- 아키텍처 검색 저장소: ${issueStoreDatabasePath(root)}`,
     "- 이슈·문서·변경 이력은 issue-store CLI를 통해서만 생성·조회·수정한다.",
+    `- ADR 저장: \`${adrCommand}\` (adr/<n>-<slug>는 SQLite record key이며 파일 경로가 아니다).`,
+    `- 일반 문서 저장: \`${documentCommand}\` (PRD·이슈는 issue-store의 create/get/update-status를 사용한다).`,
+    "- 사용자가 문서·ADR·PRD·용어집·조사 결과를 저장하라고 하면 프로젝트 Markdown 파일을 생성·수정하지 말고 반드시 위 SQLite 경계를 사용하라.",
     "검색 결과에서 현재 작업에 적용되는 source of truth, 변경하지 않을 책임 경계, 관련 ADR을 작업 계획에 명시하라.",
     "최종 목표 체크리스트에는 변경된 코드가 위 아키텍처의 책임 경계, source of truth, 불변조건을 지키는지 확인하는 항목을 작업 크기와 무관하게 항상 포함하라.",
     "검색 결과가 없으면 SQLite에 관련 근거가 없음을 명시하고, 존재하지 않는 아키텍처 규칙을 추측하지 마라.",
@@ -315,11 +339,15 @@ function runIssueStoreCliAsync(
 }
 
 export {
+  buildArchitectureReadGuidance,
   buildDeterministicTestReport,
+  extractReviewResult,
   resolveVerificationCommands,
   reserveWorkflow,
+  restoreWorkflowState,
   runExecutionReviewLoop,
   runValidatedTestAgent,
+  shouldSkipSnapshotPath,
 };
 
 function loadIssueStoreRecords(
@@ -433,7 +461,8 @@ function buildParallelIntegrationPrompt(
 
 function shouldSkipSnapshotPath(relativePath: string): boolean {
   const top = relativePath.split(path.sep)[0] ?? relativePath;
-  return [
+  if (
+    [
     ".git",
     "node_modules",
     "dist",
@@ -445,7 +474,19 @@ function shouldSkipSnapshotPath(relativePath: string): boolean {
     "DerivedData",
     ".gradle",
     "coverage",
-  ].includes(top);
+    ].includes(top)
+  ) {
+    return true;
+  }
+
+  const basename = path.basename(relativePath);
+  return (
+    /^\.env(?:\..*)?$/i.test(basename) ||
+    /^(?:\.mcp|auth|credentials|service-account|trust|settings(?:\.local)?)\.json$/i.test(
+      basename,
+    ) ||
+    /\.(?:key|pem|p12|pfx|jks)$/i.test(basename)
+  );
 }
 
 function copyWorkspaceSnapshot(sourceRoot: string, snapshotRoot: string): void {
@@ -1046,12 +1087,30 @@ function persistWorkflowState(
   const snapshot: PersistedWorkflowState = {
     reviewStage: workflowState.reviewStage,
     checklist: workflowState.checklist,
+    pendingCodingPrompt: workflowState.pendingCodingPrompt,
+    lastFailure: workflowState.lastFailure,
     improvementRound: workflowState.improvementRound,
     autoMode: workflowState.autoMode,
     autoReview: workflowState.autoReview,
     workflowId: workflowState.workflowId,
   };
   pi.appendEntry("loop-agent-state", { reason, snapshot });
+}
+
+function isPersistedWorkflowFailure(value: unknown): value is WorkflowFailure {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as { source?: unknown; items?: unknown };
+  if (candidate.source !== "review" && candidate.source !== "testing") return false;
+  if (!Array.isArray(candidate.items)) return false;
+  return candidate.items.every((item) => {
+    if (!item || typeof item !== "object") return false;
+    const failure = item as Record<string, unknown>;
+    return (
+      typeof failure.item === "string" &&
+      typeof failure.reason === "string" &&
+      typeof failure.evidence === "string"
+    );
+  });
 }
 
 /** 현재 브랜치의 마지막 유효 스냅샷만 복구하며 실행 중 잠금은 새로 시작한다. */
@@ -1071,6 +1130,13 @@ function restoreWorkflowState(ctx: ExtensionContext): boolean {
     state.reviewStage = snapshot.reviewStage ?? "idle";
     state.checklist =
       typeof snapshot.checklist === "string" ? snapshot.checklist : null;
+    state.pendingCodingPrompt =
+      typeof snapshot.pendingCodingPrompt === "string"
+        ? snapshot.pendingCodingPrompt
+        : null;
+    state.lastFailure = isPersistedWorkflowFailure(snapshot.lastFailure)
+      ? snapshot.lastFailure
+      : null;
     state.improvementRound = Number.isInteger(snapshot.improvementRound)
       ? Number(snapshot.improvementRound)
       : 0;
@@ -1223,17 +1289,27 @@ function extractReviewResult(report: string): ReviewResult {
     throw new Error("검수 보고서의 overall 판정이 올바르지 않습니다.");
   }
 
-  const failedItems = Array.isArray(parsed.failedItems)
-    ? parsed.failedItems.filter(
-        (item): item is FailedItem =>
-          typeof item?.item === "string" &&
-          typeof item?.reason === "string" &&
-          typeof item?.evidence === "string",
-      )
-    : [];
+  if (!Array.isArray(parsed.failedItems)) {
+    throw new Error("검수 보고서에 failedItems 배열이 없습니다.");
+  }
+
+  const failedItems = parsed.failedItems;
+  if (
+    failedItems.some(
+      (item) =>
+        typeof item?.item !== "string" ||
+        typeof item?.reason !== "string" ||
+        typeof item?.evidence !== "string",
+    )
+  ) {
+    throw new Error("검수 보고서의 실패 항목 형식이 올바르지 않습니다.");
+  }
 
   if (parsed.overall === "FAIL" && failedItems.length === 0) {
     throw new Error("FAIL 판정에 실패 항목이 포함되지 않았습니다.");
+  }
+  if (parsed.overall === "PASS" && failedItems.length > 0) {
+    throw new Error("PASS 판정에 실패 항목이 포함되어 있습니다.");
   }
   return { overall: parsed.overall, failedItems };
 }
@@ -1255,7 +1331,7 @@ async function runIndependentReview(
   mode: IndependentAgentMode = "review",
   process: PiProcessRuntime = processRuntime,
 ): Promise<string> {
-  const prompt =
+  const basePrompt =
     mode === "test-failure-diagnosis"
       ? [
           "당신은 planningModel 역할의 테스트 실패 원인 분석 에이전트다.",
@@ -1300,6 +1376,10 @@ async function runIndependentReview(
           "검수 체크리스트:",
           checklist,
         ].join("\n");
+
+  const personaRole: LoopAgentRole =
+    mode === "test-failure-diagnosis" ? "planning" : "verifying";
+  const prompt = withRolePersona(personaRole, basePrompt);
 
   const args = [
     "--mode",
@@ -1572,17 +1652,97 @@ function buildDeterministicTestReport(
 }
 
 async function runValidatedTestAgent(
-  _pi: ExtensionAPI,
+  pi: ExtensionAPI,
   ctx: ExtensionContext,
-  _checklist: string,
+  checklist: string,
+  workflowConfig: WorkflowConfig = config,
+  process: PiProcessRuntime = processRuntime,
 ): Promise<{
   report: string;
   result: TestResult;
   verification: VerificationResult;
 }> {
   const verification = await runVerification(resolveVerificationCommands(ctx.cwd));
-  const { report, result } = buildDeterministicTestReport(verification);
-  return { report, result, verification };
+  const deterministic = buildDeterministicTestReport(verification);
+  const testModel = workflowConfig.testModel ?? workflowConfig.codingModel;
+  const testThinkingLevel =
+    workflowConfig.testThinkingLevel ?? workflowConfig.codingThinkingLevel;
+
+  if (
+    !testModel ||
+    !ctx.ui ||
+    typeof ctx.ui.notify !== "function" ||
+    typeof ctx.ui.setStatus !== "function"
+  ) {
+    return { ...deterministic, verification };
+  }
+
+  const testAgentPrompt = withRolePersona(
+    "test",
+    [
+      "당신은 테스트 역할 에이전트다.",
+      "결정적 검증 러너가 실제 명령을 이미 실행했으며 PASS/FAIL 판정의 source of truth다.",
+      "코드나 파일을 수정하지 말고, 검증 결과와 목표 체크리스트를 대조해 테스트 관점의 설명과 남은 공백만 보고하라.",
+      "검증 러너의 PASS/FAIL 판정을 변경하거나 추측으로 보완하지 말라.",
+      "보고서는 한국어로 작성하라.",
+      "",
+      "목표 결과 체크리스트:",
+      checklist,
+      "",
+      "결정적 검증 결과:",
+      deterministic.report,
+    ].join("\n"),
+  );
+  const args = [
+    "--mode",
+    "json",
+    "--print",
+    "--no-session",
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-context-files",
+    "--tools",
+    "read,grep,find,ls",
+    "--model",
+    testModel,
+  ];
+  if (testThinkingLevel) args.push("--thinking", testThinkingLevel);
+  args.push(testAgentPrompt);
+
+  try {
+    const result = await process.runPiCommandWithProgress(
+      pi,
+      ctx.cwd,
+      ctx.ui,
+      "테스트 에이전트",
+      args,
+      TEST_TIMEOUT_MS,
+      ctx.isIdle,
+    );
+    if (result.code !== 0 || !result.finalText.trim()) {
+      throw new Error(result.stderr.trim() || `exit code ${result.code}`);
+    }
+
+    return {
+      report: [
+        deterministic.report,
+        "",
+        "## 테스트 역할 에이전트 보고",
+        result.finalText.trim(),
+      ].join("\n"),
+      result: deterministic.result,
+      verification,
+    };
+  } catch (error) {
+    // 테스트 PASS/FAIL은 결정적 검증 결과를 유지한다. 보조 테스트 에이전트
+    // 실패가 전체 워크플로를 잘못 실패시키지 않도록 결정적 보고서로 계속한다.
+    ctx.ui.notify(
+      `loop-agent: 테스트 역할 에이전트를 사용할 수 없어 결정적 검증 결과만 사용합니다 (${error instanceof Error ? error.message : String(error)}).`,
+      "warning",
+    );
+    return { ...deterministic, verification };
+  }
 }
 
 async function runParallelCodingPhase(
@@ -1763,7 +1923,7 @@ async function runCodingAgent(
   if (modelName) args.push("--model", modelName);
   if (workflowConfig.codingThinkingLevel)
     args.push("--thinking", workflowConfig.codingThinkingLevel);
-  args.push(prompt);
+  args.push(withRolePersona("coding", prompt));
 
   // loop-agent만 환경 플래그로 비활성화하고 MCP 어댑터 등 나머지 확장은
   // 그대로 로드한다. 직접 spawn해서 stdout/stderr를 중간중간 status로 흘린다.
@@ -1773,8 +1933,7 @@ async function runCodingAgent(
     ctx.ui,
     "코드 에이전트",
     args,
-    // 코드 에이전트는 긴 도구 실행을 허용하고 wall-clock 제한을 두지 않는다.
-    undefined,
+    resolveCodingTimeoutMs(),
     ctx.isIdle,
   );
   if (result.code !== 0) {
@@ -1903,13 +2062,15 @@ async function recoverFromTestFailure(
   );
 
   const improvementRound = scheduleImprovement(workflowState);
-  persistWorkflowState(pi, "test-failure-improvement-scheduled", workflowState);
   const codingPrompt = buildImprovementPrompt(
     diagnosis.result,
     workflowState.checklist ?? "",
     improvementRound,
     ctx.cwd,
   );
+  workflowState.lastFailure = { source: "testing", items: diagnosis.result.failedItems };
+  workflowState.pendingCodingPrompt = codingPrompt;
+  persistWorkflowState(pi, "test-failure-improvement-scheduled", workflowState);
   ctx.ui.notify(
     `loop-agent: planningModel 분석을 반영해 코드 에이전트를 재실행합니다 (${improvementRound}/${workflowConfig.maxImprovementRounds}).`,
     "warning",
@@ -1928,6 +2089,7 @@ async function runCodingStage(
   if (!codingPrompt) return "completed";
 
   const workflowState = execution.state;
+  workflowState.pendingCodingPrompt = codingPrompt;
   markAwaitingExecution(workflowState);
   persistWorkflowState(pi, "coding-started", workflowState);
   ctx.ui.notify("loop-agent: 코드 에이전트를 실행합니다.", "info");
@@ -1956,6 +2118,7 @@ async function runCodingStage(
     },
     { triggerTurn: false },
   );
+  workflowState.pendingCodingPrompt = null;
   persistWorkflowState(pi, "coding-completed", workflowState);
   return "completed";
 }
@@ -1982,7 +2145,13 @@ async function runTestingStage(
   let testReport: string | null = null;
   let testResult: TestResult | null = null;
   try {
-    const testRun = await runValidatedTestAgent(pi, ctx, checklist);
+    const testRun = await runValidatedTestAgent(
+      pi,
+      ctx,
+      checklist,
+      execution.getConfig(),
+      execution.process,
+    );
     testReport = testRun.report;
     testResult = testRun.result;
     if (!isCurrentWorkflowTransition(workflowState, workflowId)) return { status: "stale" };
@@ -2026,6 +2195,16 @@ async function runTestingStage(
       "warning",
     );
   }
+  if (testResult?.overall === "FAIL") {
+    workflowState.lastFailure = {
+      source: "testing",
+      items: testResult.failedCommands.map((item) => ({
+        item: item.command,
+        reason: item.reason,
+        evidence: item.evidence,
+      })),
+    };
+  }
   persistWorkflowState(pi, "testing-completed", workflowState);
   return { status: "completed", testReport, testResult };
 }
@@ -2067,6 +2246,10 @@ async function runReviewStage(
 
   const report = buildMergedReviewReport(rawReviewReport, testResult);
   const result = mergeVerificationResults(rawReviewResult, testResult);
+  workflowState.lastFailure =
+    result.overall === "FAIL"
+      ? { source: "review", items: result.failedItems }
+      : null;
   pi.appendEntry("loop-agent-review", {
     workflowId,
     checklist,
@@ -2102,13 +2285,14 @@ async function runReviewStage(
   }
 
   const improvementRound = scheduleImprovement(workflowState);
-  persistWorkflowState(pi, "improvement-scheduled", workflowState);
   const codingPrompt = buildImprovementPrompt(
     result,
     checklist,
     improvementRound,
     ctx.cwd,
   );
+  workflowState.pendingCodingPrompt = codingPrompt;
+  persistWorkflowState(pi, "improvement-scheduled", workflowState);
   ctx.ui.notify(
     `loop-agent: 실패 항목 개선 ${improvementRound}/${workflowConfig.maxImprovementRounds}차를 준비합니다.`,
     "warning",
@@ -2135,7 +2319,7 @@ async function runExecutionReviewLoop(
   }
 
   workflowState.processingWorkflowId = workflowId;
-  let codingPrompt = initialCodingPrompt;
+  let codingPrompt = initialCodingPrompt ?? workflowState.pendingCodingPrompt ?? undefined;
 
   try {
     while (
@@ -2317,7 +2501,12 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
         // 중단 지점에서 코드를 무조건 재실행하면 이미 반영된 변경을 중복 적용할
         // 수 있으므로 먼저 현재 파일 상태를 검수하고 부족한 항목만 개선한다.
         // session_start 핸들러를 워크플로 종료까지 붙들지 않도록 분리 실행한다.
-        startExecutionReviewLoop(pi, ctx, state.workflowId);
+        startExecutionReviewLoop(
+          pi,
+          ctx,
+          state.workflowId,
+          state.pendingCodingPrompt ?? undefined,
+        );
       }
     }
 
@@ -2352,7 +2541,12 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
         "loop-agent: 컴팩션 이후 진행 중이던 워크플로를 이어서 실행합니다.",
         "info",
       );
-      startExecutionReviewLoop(pi, ctx, state.workflowId);
+      startExecutionReviewLoop(
+        pi,
+        ctx,
+        state.workflowId,
+        state.pendingCodingPrompt ?? undefined,
+      );
     }
   });
 
@@ -2395,12 +2589,15 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
           root,
           semanticContext,
         ) =>
-          buildPlanningPrompt(
-            promptObjective,
-            workflowId,
-            root,
-            semanticContext,
-            { skillPath, buildArchitectureReadGuidance },
+          withRolePersona(
+            "planning",
+            buildPlanningPrompt(
+              promptObjective,
+              workflowId,
+              root,
+              semanticContext,
+              { skillPath, buildArchitectureReadGuidance },
+            ),
           ),
       },
       { skillPath, buildArchitectureReadGuidance },
@@ -2445,6 +2642,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       semanticContext,
     );
 
+    state.pendingCodingPrompt = prompt;
     persistWorkflowState(piApi, "quick-goal-started");
 
     const modelSelected = await selectModel(
@@ -2497,7 +2695,14 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       autoReview: false,
     });
     if (!preparation) return { handled: false };
-    if ("blocked" in preparation) return { handled: true };
+    if ("blocked" in preparation) {
+      // 검색 실패는 스타터가 원문을 소비하면 안 된다. 사용자가 같은 요청을
+      // 검색 환경 복구 후 다시 보낼 수 있도록 Pi 코어에 원본을 통과시킨다.
+      if (preparation.reason === "semantic-search-failed") {
+        return { handled: false };
+      }
+      return { handled: true };
+    }
     return { handled: true, prompt: preparation.prompt };
   }
 
@@ -2663,6 +2868,25 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
         workflowId,
         checklist: latestChecklist,
       });
+      const codingPrompt = state.autoMode
+        ? [
+            "자동 실행 모드입니다. 아래 확정 명세와 구현 계획을 즉시 실행하세요.",
+            "목표 체크리스트를 모두 만족하도록 코드를 수정하고 필요한 테스트를 실행하세요.",
+            "작업을 중간에 멈추거나 사용자 승인을 다시 요청하지 말고, 완료 후 변경 내용과 검증 근거를 보고하세요.",
+            "",
+            buildImplementSkillGuidance(ctx.cwd),
+            "",
+            buildTaskTrackingInstructions(ctx.cwd),
+            "",
+            responseWorkflowId && currentWorkflowId !== responseWorkflowId
+              ? planningResponse.replace(
+                  WORKFLOW_MARKER_PREFIX + responseWorkflowId + " -->",
+                  WORKFLOW_MARKER_PREFIX + currentWorkflowId + " -->",
+                )
+              : planningResponse,
+          ].join("\n")
+        : null;
+      state.pendingCodingPrompt = codingPrompt;
       persistWorkflowState(pi, "checklist-captured");
       await selectModel(
         pi,
@@ -2675,31 +2899,13 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       if (state.autoMode) {
         // /hard-goal, /easy-goal 작업은 사용자 승인을 다시 기다리지 않는다. 확장이 별도 코드
         // 프로세스의 종료 코드를 직접 기다리므로 실행 실패도 상태에 반영된다.
-        const executionPlanningResponse =
-          responseWorkflowId && currentWorkflowId !== responseWorkflowId
-            ? planningResponse.replace(
-                WORKFLOW_MARKER_PREFIX + responseWorkflowId + " -->",
-                WORKFLOW_MARKER_PREFIX + currentWorkflowId + " -->",
-              )
-            : planningResponse;
-        const codingPrompt = [
-          "자동 실행 모드입니다. 아래 확정 명세와 구현 계획을 즉시 실행하세요.",
-          "목표 체크리스트를 모두 만족하도록 코드를 수정하고 필요한 테스트를 실행하세요.",
-          "작업을 중간에 멈추거나 사용자 승인을 다시 요청하지 말고, 완료 후 변경 내용과 검증 근거를 보고하세요.",
-          "",
-          buildImplementSkillGuidance(ctx.cwd),
-          "",
-          buildTaskTrackingInstructions(ctx.cwd),
-          "",
-          executionPlanningResponse,
-        ].join("\n");
         ctx.ui.notify(
           "loop-agent: 계획과 체크리스트가 확정되어 코드 에이전트를 자동 실행합니다.",
           "info",
         );
         // agent_end 안에서 await하면 isStreaming이 워크플로 종료까지 풀리지
         // 않아 진행 메시지가 전부 steer 큐로 사라진다. 분리 실행이 필수다.
-        startExecutionReviewLoop(pi, ctx, workflowId, codingPrompt);
+        startExecutionReviewLoop(pi, ctx, workflowId, codingPrompt ?? undefined);
         return;
       }
 

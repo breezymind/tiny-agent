@@ -109,15 +109,23 @@ test("stores, updates, searches, and deletes architecture documents in SQLite", 
   );
   const adr = runCli(
     root,
-    "put-architecture",
+    "put-adr",
     "--source-path",
     "adr/0001",
-    "--doc-type",
-    "adr",
     "--heading",
     "Decision",
     "--body",
     "Use a local SQLite boundary.",
+  );
+  const document = runCli(
+    root,
+    "put-document",
+    "--source-path",
+    "research/image-composition",
+    "--heading",
+    "Image composition pattern",
+    "--body",
+    "Keep the image composition pattern in the SQLite document store.",
   );
   const updated = runCli(
     root,
@@ -132,6 +140,8 @@ test("stores, updates, searches, and deletes architecture documents in SQLite", 
     "SQLite is the only source of truth.",
   );
   const listed = runCli(root, "list-architecture");
+  const listedAdrs = runCli(root, "list-architecture", "--doc-type", "adr");
+  const listedDocs = runCli(root, "list-architecture", "--doc-type", "doc");
   const fetched = runCli(root, "get-architecture", "context", "0");
   const searched = runCli(root, "search-architecture", "source of truth", "--limit", "10");
   const deleted = runCli(root, "delete-architecture", "adr/0001", "0");
@@ -139,12 +149,15 @@ test("stores, updates, searches, and deletes architecture documents in SQLite", 
   delete globalThis.issueStoreTestEnv;
   assert.equal(context.document.doc_type, "context");
   assert.equal(adr.document.doc_type, "adr");
+  assert.equal(document.document.doc_type, "doc");
   assert.equal(updated.document.body, "SQLite is the only source of truth.");
-  assert.equal(listed.count, 2);
+  assert.equal(listed.count, 3);
+  assert.equal(listedAdrs.count, 1);
+  assert.equal(listedDocs.count, 1);
   assert.equal(fetched.document.body, updated.document.body);
   assert.ok(searched.results.some((document) => document.source_path === "context"));
   assert.equal(deleted.deleted, true);
-  assert.equal(runCli(root, "list-architecture").count, 1);
+  assert.equal(runCli(root, "list-architecture").count, 2);
 });
 
 test("records and lists change history in SQLite", () => {

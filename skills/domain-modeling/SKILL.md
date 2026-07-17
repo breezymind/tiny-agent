@@ -9,7 +9,7 @@ Actively build and sharpen the project's domain model as you design. Challenge t
 
 ## SQLite document structure
 
-Use the installed `scripts/issue-store.js` CLI. Project glossary and architecture records live in `docs/issues.sqlite` by default. Do not create, edit, or scan project Markdown files for them.
+Use the installed `scripts/issue-store.js` CLI. Project glossary and architecture records live in `docs/issues.sqlite` by default. Do not create, edit, or scan project Markdown files for them. Markdown syntax may be used inside a SQLite `body`, but a project `.md` file is never the storage target.
 
 ```text
 architecture_documents
@@ -20,7 +20,18 @@ architecture_documents
 
 Store the current glossary as one or more `doc_type=context` records with stable logical keys such as `context/main` or `context/ordering`. Store decisions as append-only `doc_type=adr` records with keys such as `adr/0001-orders`. These are record keys, not filesystem paths.
 
-Create records lazily. Use `list-architecture`, `get-architecture`, and `search-architecture` to discover existing records. Use `put-architecture` to create or replace a record, and never edit the SQLite file directly.
+Create records lazily. Use `list-architecture`, `get-architecture`, and `search-architecture` to discover existing records. Use the typed CLI commands below to write records, and never edit the SQLite file directly.
+
+### Document storage contract
+
+All user-requested documents are SQLite records. Choose the storage command by record type:
+
+- ADR / decision: `put-adr --source-path "adr/<n>-<slug>" --heading "..." --body "..."`
+- Context / glossary: `put-context --source-path "context/<name>" --heading "..." --body "..."`
+- Research / design / reference document: `put-document --source-path "doc/<slug>" --heading "..." --body "..."`
+- PRD / implementation issue: the issue-store `create` or `get`/update flow, with the complete document in the SQLite issue `body`
+
+When the user says to save, record, or update a document, do not create or modify `docs/adr/*.md`, `docs/*.md`, `docs/tasks/*.md`, `.agent/prd/*.md`, or another project Markdown artifact. A key such as `adr/0004-image-composition` is a logical SQLite `source_path`, not a filesystem path. Existing Markdown files are historical or skill-internal references only.
 
 ## During the session
 
@@ -42,7 +53,7 @@ When the user states how something works, check whether the code agrees. If you 
 
 ### Update the SQLite glossary inline
 
-When a term is resolved, fetch the relevant context record, update its complete body, and write it back with `put-architecture` immediately. Do not batch these updates. Use the content format in [CONTEXT-FORMAT.md](./CONTEXT-FORMAT.md). The command must include a stable `source_path`, `section_index`, `heading`, `doc_type=context`, and the complete `body`.
+When a term is resolved, fetch the relevant context record, update its complete body, and write it back with `put-context` immediately. Do not batch these updates. Use the content format in [CONTEXT-FORMAT.md](./CONTEXT-FORMAT.md). The command must include a stable `source_path`, `section_index`, `heading`, and the complete `body`.
 
 Context records should be devoid of implementation details. Do not treat them as a spec, scratch pad, or repository for implementation decisions. They are glossaries and nothing else.
 
@@ -54,4 +65,4 @@ Only offer to create an ADR when all three are true:
 2. **Surprising without context** — a future reader will wonder "why did they do it this way?"
 3. **The result of a real trade-off** — there were genuine alternatives and you picked one for specific reasons
 
-If any of the three is missing, skip the ADR. Otherwise use [ADR-FORMAT.md](./ADR-FORMAT.md), then append a new SQLite `doc_type=adr` record with `put-architecture`; never modify an existing ADR record.
+If any of the three is missing, skip the ADR. Otherwise use [ADR-FORMAT.md](./ADR-FORMAT.md), then append a new SQLite `doc_type=adr` record with `put-adr`; never modify an existing ADR record or create a Markdown ADR file.

@@ -18,6 +18,8 @@ test("state transitions keep workflow identity and terminal cleanup explicit", (
   assert.equal(state.workflowId, workflowId);
   assert.equal(state.autoMode, true);
   assert.equal(state.reviewStage, "awaiting-execution");
+  assert.equal(state.pendingCodingPrompt, null);
+  assert.equal(state.lastFailure, null);
 
   markTesting(state);
   markReviewing(state);
@@ -30,12 +32,18 @@ test("state transitions keep workflow identity and terminal cleanup explicit", (
   assert.equal(state.workflowId, null);
   assert.equal(state.processingWorkflowId, null);
   assert.equal(state.autoMode, false);
+  assert.equal(state.pendingCodingPrompt, null);
+  assert.equal(state.lastFailure, null);
 });
 
 test("failure transition clears execution ownership without touching the checklist", () => {
   const state = createInitialGateState();
   reserveWorkflow(state, true, "testing", "preserve me");
   state.processingWorkflowId = state.workflowId;
+  state.lastFailure = {
+    source: "testing",
+    items: [{ item: "test", reason: "failed", evidence: "fixture" }],
+  };
 
   failWorkflow(state);
 
@@ -44,4 +52,5 @@ test("failure transition clears execution ownership without touching the checkli
   assert.equal(state.workflowId, null);
   assert.equal(state.processingWorkflowId, null);
   assert.equal(state.autoReview, true);
+  assert.equal(state.lastFailure?.items[0].item, "test");
 });

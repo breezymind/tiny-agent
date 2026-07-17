@@ -120,6 +120,26 @@ PI_VERIFICATION_COMMANDS='[{"program":"npm","args":["run","check"],"timeoutMs":1
 모델은 실패 로그를 해석해 개선 방향을 제안할 수 있지만, 검증 결과 자체를 PASS로 바꿀
 권한은 없습니다.
 
+### loop-agent 역할별 persona
+
+`~/.pi/agent/persona.json`에 역할별 `instructions`를 정의하면
+loop-agent가 해당 모델을 실행할 때 persona를 프롬프트에 자동으로 주입합니다.
+
+```json
+{
+  "planning": { "instructions": "요구사항을 계획과 위험으로 변환하라." },
+  "coding": { "instructions": "최소 변경으로 구현하고 관련 검증을 실행하라." },
+  "verifying": { "instructions": "근거를 포함해 체크리스트를 findings-first로 검수하라." },
+  "test": { "instructions": "검증 결과와 체크리스트의 테스트 공백을 분석하라." }
+}
+```
+
+역할 이름은 `planning`/`plan`/`architect`, `coding`/`implement`/`builder`,
+`verifying`/`verify`/`review`/`reviewer`, `test`/`testing`/`tester`를 지원합니다.
+`planningModel`, `codingModel`, `verifyingModel`, `testModel`은 각각 해당 역할의
+모델을 선택합니다. 테스트 PASS/FAIL은 여전히 결정적 검증 러너가 판정하고,
+`testModel`은 결과 설명을 보조합니다.
+
 ## SQL VectorDB 이슈 저장소
 
 이슈 트래커의 source of truth는 프로젝트 로컬 `docs/issues.sqlite`입니다.
@@ -143,7 +163,7 @@ Node.js의 `better-sqlite3`로 SQLite를 열고 `@sqliteai/sqlite-vector` 확장
 
 아키텍처 문서 section은 `architecture_documents` SQLite 테이블에 저장되고
 `search-architecture`로 검색합니다. 원문을 직접 읽거나 Markdown 파일을 색인하는 런타임 경로는 없습니다.
-문서 추가·수정·삭제는 `put-architecture`, `get-architecture`, `delete-architecture` CLI로 수행합니다.
+문서 추가·수정·삭제는 typed `put-document`·`put-context`·`put-adr`, `get-architecture`, `delete-architecture` CLI로 수행합니다. `put-architecture`는 하위 호환용 generic 명령입니다.
 
 ```bash
 AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
@@ -151,8 +171,13 @@ PROJECT=/path/to/project
 node "$AGENT_DIR/scripts/issue-store.js" put-architecture \
   --source-path "adr/0004" --doc-type adr --section-index 0 \
   --heading "Decision" --body "SQLite is the source of truth." --root "$PROJECT"
+node "$AGENT_DIR/scripts/issue-store.js" put-adr \
+  --source-path "adr/0005-image-composition" \
+  --heading "Image composition" --body "Decision and rationale." --root "$PROJECT"
 node "$AGENT_DIR/scripts/issue-store.js" search-architecture "관련 아키텍처 규칙" --limit 8 --root "$PROJECT"
 ```
+
+사용자가 문서·ADR·용어집·조사 결과·PRD를 저장하라고 하면 프로젝트 Markdown 파일을 만들지 않습니다. Markdown 문법은 SQLite `body` 안에서만 사용할 수 있으며, PRD·이슈는 issue-store의 `create`/`get` 흐름으로 저장합니다.
 
 ### SQLite 문서·변경 이력 관리
 

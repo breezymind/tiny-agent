@@ -196,6 +196,122 @@ function messageTypes(runtime) {
   return runtime.messages.map(({ message }) => message.customType).filter(Boolean);
 }
 
+test("architecture guidance routes every durable document to SQLite", async () => {
+  const runtime = createFakePiRuntime();
+  try {
+    const module = await loadLoopAgent(runtime);
+    const guidance = module.buildArchitectureReadGuidance(runtime.projectRoot);
+
+    assert.match(guidance, /put-adr/);
+    assert.match(guidance, /put-document/);
+    assert.match(guidance, /PRD·이슈는 issue-store의 create\/get\/update-status/);
+    assert.match(guidance, /프로젝트 Markdown 파일을 생성·수정하지 말고/);
+  } finally {
+    runtime.cleanup();
+  }
+});
+
+test("review parser rejects contradictory PASS results", async () => {
+  const runtime = createFakePiRuntime();
+  try {
+    const module = await loadLoopAgent(runtime);
+    assert.throws(
+      () =>
+        module.extractReviewResult(
+          [
+            "<!-- grill-review:start -->",
+            JSON.stringify({
+              overall: "PASS",
+              failedItems: [
+                { item: "fixture", reason: "still failing", evidence: "test" },
+              ],
+            }),
+            "<!-- grill-review:end -->",
+          ].join("\n"),
+        ),
+      /PASS 판정에 실패 항목이 포함되어 있습니다/,
+    );
+  } finally {
+    runtime.cleanup();
+  }
+});
+
+test("snapshot filtering excludes common credential files", async () => {
+  const runtime = createFakePiRuntime();
+  try {
+    const module = await loadLoopAgent(runtime);
+    assert.equal(module.shouldSkipSnapshotPath(".env.local"), true);
+    assert.equal(module.shouldSkipSnapshotPath(".mcp.json"), true);
+    assert.equal(module.shouldSkipSnapshotPath("certs/client.pem"), true);
+    assert.equal(module.shouldSkipSnapshotPath("src/auth.ts"), false);
+  } finally {
+    runtime.cleanup();
+  }
+});
+
+test("resume restores a persisted coding prompt instead of skipping coding", async () => {
+  const runtime = createFakePiRuntime();
+  const previousPath = process.env.PATH;
+  const previousVerification = process.env.PI_VERIFICATION_COMMANDS;
+  try {
+    const module = await loadLoopAgent(runtime);
+    const verificationScript = createVerificationScript(runtime, "pass");
+    process.env.PATH = `${runtime.binDir}${path.delimiter}${previousPath || ""}`;
+    process.env.PI_VERIFICATION_COMMANDS = JSON.stringify([
+      {
+        program: process.execPath,
+        args: [verificationScript],
+        cwd: runtime.projectRoot,
+        timeoutMs: 5000,
+        required: true,
+      },
+    ]);
+    const workflowId = "resume-workflow";
+    const restored = module.restoreWorkflowState({
+      ...runtime.ctx,
+      sessionManager: {
+        getBranch: () => [
+          {
+            type: "custom",
+            customType: "loop-agent-state",
+            data: {
+              snapshot: {
+                reviewStage: "awaiting-execution",
+                checklist: "resume checklist",
+                pendingCodingPrompt: "resume coding prompt",
+                lastFailure: {
+                  source: "review",
+                  items: [
+                    { item: "fixture", reason: "failed", evidence: "saved" },
+                  ],
+                },
+                improvementRound: 1,
+                autoMode: true,
+                autoReview: false,
+                workflowId,
+              },
+            },
+          },
+        ],
+      },
+    });
+    assert.equal(restored, true);
+
+    await module.runExecutionReviewLoop(runtime.pi, runtime.ctx, workflowId);
+
+    assert.equal(
+      runtime.entries.filter((entry) => entry.type === "loop-agent-coding-result").length,
+      1,
+    );
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (previousVerification === undefined) delete process.env.PI_VERIFICATION_COMMANDS;
+    else process.env.PI_VERIFICATION_COMMANDS = previousVerification;
+    runtime.cleanup();
+  }
+});
+
 test("fake Pi runtime traverses coding, testing, review, and completion stages", async () => {
   const runtime = createFakePiRuntime();
   try {
@@ -246,6 +362,13 @@ test("fake Pi runtime schedules a review failure for one improvement round", asy
     assert.equal(reviews.length, 2);
     assert.equal(reviews[0].payload.result.overall, "FAIL");
     assert.equal(reviews[1].payload.result.overall, "PASS");
+    const scheduled = runtime.entries.find(
+      (entry) =>
+        entry.type === "loop-agent-state" &&
+        entry.payload.reason === "improvement-scheduled",
+    );
+    assert.match(scheduled.payload.snapshot.pendingCodingPrompt, /자동 개선/);
+    assert.equal(scheduled.payload.snapshot.lastFailure.source, "review");
   } finally {
     runtime.cleanup();
   }
