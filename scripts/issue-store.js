@@ -11,6 +11,7 @@ const VECTOR_DIMENSION = 1024;
 const ISSUE_ID_PATTERN = /^T-\d{3}$/;
 const VALID_STATUSES = new Set(["backlog", "current", "done"]);
 const VALID_EMBEDDING_STATUSES = new Set(["missing", "ready", "failed"]);
+const VALID_DOCUMENT_TYPES = new Set(["context", "doc", "adr"]);
 
 function emitProgress(message) {
   process.stderr.write(`issue-store: ${message}\n`);
@@ -66,6 +67,17 @@ CREATE INDEX IF NOT EXISTS architecture_documents_source_index
   ON architecture_documents(source_path);
 CREATE INDEX IF NOT EXISTS architecture_documents_embedding_status_index
   ON architecture_documents(embedding_status);
+
+CREATE TABLE IF NOT EXISTS change_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  change_date TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  issue_id TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS change_log_date_index ON change_log(change_date);
+CREATE INDEX IF NOT EXISTS change_log_issue_index ON change_log(issue_id);
 `;
 
 function now() {
@@ -84,7 +96,7 @@ function ensureArchitectureDocumentSchema(db) {
   if (!table?.sql || table.sql.includes("'doc'")) return;
 
   emitProgress("아키텍처 문서 테이블을 doc 유형을 지원하도록 업그레이드합니다.");
-  const migrate = db.transaction(() => {
+  const upgrade = db.transaction(() => {
     db.exec("DROP INDEX IF EXISTS architecture_documents_source_index");
     db.exec("DROP INDEX IF EXISTS architecture_documents_embedding_status_index");
     db.exec("ALTER TABLE architecture_documents RENAME TO architecture_documents_legacy");
@@ -120,7 +132,7 @@ function ensureArchitectureDocumentSchema(db) {
     db.exec("CREATE INDEX architecture_documents_source_index ON architecture_documents(source_path)");
     db.exec("CREATE INDEX architecture_documents_embedding_status_index ON architecture_documents(embedding_status)");
   });
-  migrate();
+  upgrade();
 }
 
 function openStore(dbPath) {
@@ -290,72 +302,6 @@ function bodyForEmbedding(issue) {
   ].filter(Boolean).join("\n\n");
 }
 
-function architectureDocumentFiles(root) {
-  const files = [];
-  const contextPath = path.join(root, "CONTEXT.md");
-  if (fs.existsSync(contextPath)) files.push(contextPath);
-
-  const docsDirectory = path.join(root, "docs");
-  if (fs.existsSync(docsDirectory)) {
-    for (const entry of fs.readdirSync(docsDirectory, { withFileTypes: true })) {
-      if (entry.isFile() && entry.name.endsWith(".md")) {
-        files.push(path.join(docsDirectory, entry.name));
-      }
-    }
-  }
-
-  const adrDirectory = path.join(root, "docs", "adr");
-  if (fs.existsSync(adrDirectory)) {
-    const walk = (directory) => {
-      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-        const filePath = path.join(directory, entry.name);
-        if (entry.isDirectory()) walk(filePath);
-        else if (entry.isFile() && entry.name.endsWith(".md")) files.push(filePath);
-      }
-    };
-    walk(adrDirectory);
-  }
-  return files.sort();
-}
-
-function architectureSections(markdown) {
-  const headings = [...markdown.matchAll(/^(#{1,6})\s+(.+?)\s*$/gm)];
-  if (headings.length === 0) {
-    return [{ heading: "Document", body: markdown.trim() }];
-  }
-  return headings.map((heading, index) => {
-    const start = heading.index || 0;
-    const end = headings[index + 1]?.index || markdown.length;
-    return {
-      heading: heading[2].trim(),
-      body: markdown.slice(start, end).trim(),
-    };
-  });
-}
-
-function architectureChunks(root, filePath) {
-  const markdown = fs.readFileSync(filePath, "utf8");
-  const sourcePath = path.relative(root, filePath);
-  const adrDirectory = path.join(root, "docs", "adr");
-  const docType = path.basename(filePath) === "CONTEXT.md"
-    ? "context"
-    : filePath.startsWith(`${adrDirectory}${path.sep}`)
-      ? "adr"
-      : "doc";
-  return architectureSections(markdown).map((section, sectionIndex) => {
-    const searchableBody = [sourcePath, section.heading, section.body].join("\n\n");
-    return {
-      source_path: sourcePath,
-      section_index: sectionIndex,
-      heading: section.heading,
-      doc_type: docType,
-      body: section.body,
-      content_hash: crypto.createHash("sha256").update(searchableBody).digest("hex"),
-      searchable_body: searchableBody,
-    };
-  });
-}
-
 function formatArchitectureDocument(row, distance) {
   const document = {
     source_path: row.source_path,
@@ -423,80 +369,134 @@ function upsertArchitectureDocument(store, chunk, embedding, error = null) {
   }
 }
 
-function indexArchitectureDocuments(store, options) {
-  const files = architectureDocumentFiles(options.root);
-  const chunks = files.flatMap((filePath) => architectureChunks(options.root, filePath));
-  const existing = store.db.prepare("SELECT * FROM architecture_documents ORDER BY id").all();
-  const existingByKey = new Map(
-    existing.map((row) => [`${row.source_path}:${row.section_index}`, row]),
-  );
-  const desiredKeys = new Set(
-    chunks.map((chunk) => `${chunk.source_path}:${chunk.section_index}`),
-  );
-  const stale = existing.filter(
-    (row) => !desiredKeys.has(`${row.source_path}:${row.section_index}`),
-  );
-  const pending = chunks.filter((chunk) => {
-    const row = existingByKey.get(`${chunk.source_path}:${chunk.section_index}`);
-    return !row || row.content_hash !== chunk.content_hash || row.embedding_status !== "ready";
-  });
-
-  emitProgress(`아키텍처 문서 ${files.length}개, section ${chunks.length}개를 확인합니다.`);
-  let embeddings = [];
-  let embeddingError = null;
-  if (pending.length > 0) {
-    try {
-      embeddings = createEmbeddings(
-        options.root,
-        pending.map((chunk) => chunk.searchable_body),
-        options.embeddingCommand,
-        pending.map((chunk) => `${chunk.source_path}#${chunk.heading}`),
-      );
-    } catch (error) {
-      embeddingError = error instanceof Error ? error.message : String(error);
-      emitProgress(`아키텍처 문서 임베딩 실패; 원문은 저장합니다: ${embeddingError}`);
-    }
+function validateDocumentType(docType) {
+  if (!VALID_DOCUMENT_TYPES.has(docType)) {
+    throw new Error(`doc_type은 context/doc/adr 중 하나여야 합니다: ${docType}`);
   }
+}
 
-  const embeddingByKey = new Map(
-    pending.map((chunk, index) => [
-      `${chunk.source_path}:${chunk.section_index}`,
-      embeddings[index],
-    ]),
-  );
-  const transaction = store.db.transaction(() => {
-    for (const row of stale) {
-      store.db
-        .prepare("DELETE FROM architecture_documents WHERE source_path = ? AND section_index = ?")
-        .run(row.source_path, row.section_index);
-    }
-    for (const chunk of chunks) {
-      const key = `${chunk.source_path}:${chunk.section_index}`;
-      const existingRow = existingByKey.get(key);
-      if (
-        existingRow &&
-        existingRow.content_hash === chunk.content_hash &&
-        existingRow.embedding_status === "ready"
-      ) {
-        continue;
-      }
-      upsertArchitectureDocument(store, chunk, embeddingByKey.get(key), embeddingError);
-    }
-  });
-  transaction();
+function documentContentHash(sourcePath, sectionIndex, heading, body) {
+  return crypto
+    .createHash("sha256")
+    .update([sourcePath, sectionIndex, heading, body].join("\n\n"))
+    .digest("hex");
+}
 
-  const failed = pending.filter((chunk) => !embeddingByKey.get(`${chunk.source_path}:${chunk.section_index}`));
-  emitProgress(
-    `아키텍처 문서 색인 완료: ${pending.length - failed.length}개 임베딩, ${failed.length}개 실패, ${stale.length}개 제거.`,
-  );
-  return {
-    files: files.map((file) => path.relative(options.root, file)),
-    document_count: chunks.length,
-    embedded_count: pending.length - failed.length,
-    failed_count: failed.length,
-    removed_count: stale.length,
-    failed_documents: failed.map((chunk) => `${chunk.source_path}#${chunk.heading}`),
+function putArchitectureDocument(store, options) {
+  const sourcePath = String(options.source_path || options.sourcePath || "").trim();
+  const heading = String(options.heading || "").trim();
+  const body = String(options.body || "").trim();
+  const sectionIndex = Number(options.section_index ?? options.sectionIndex ?? 0);
+  const docType = String(options.doc_type || options.docType || "doc").trim();
+  if (!sourcePath) throw new Error("source_path가 필요합니다.");
+  if (!heading) throw new Error("heading이 필요합니다.");
+  if (!body) throw new Error("body가 필요합니다.");
+  if (!Number.isInteger(sectionIndex) || sectionIndex < 0) {
+    throw new Error("section_index는 0 이상의 정수여야 합니다.");
+  }
+  validateDocumentType(docType);
+
+  const chunk = {
+    source_path: sourcePath,
+    section_index: sectionIndex,
+    heading,
+    doc_type: docType,
+    body,
+    content_hash: documentContentHash(sourcePath, sectionIndex, heading, body),
+    searchable_body: [sourcePath, heading, body].join("\n\n"),
   };
+  let embedding;
+  let embeddingError = null;
+  try {
+    embedding = createEmbedding(options.root, chunk.searchable_body, options.embeddingCommand);
+  } catch (error) {
+    embeddingError = error instanceof Error ? error.message : String(error);
+    emitProgress(`문서 임베딩 실패; 원문은 저장합니다: ${embeddingError}`);
+  }
+  upsertArchitectureDocument(store, chunk, embedding, embeddingError);
+  return formatArchitectureDocument(
+    store.db
+      .prepare("SELECT * FROM architecture_documents WHERE source_path = ? AND section_index = ?")
+      .get(sourcePath, sectionIndex),
+  );
+}
+
+function listArchitectureDocuments(store, options) {
+  const rows = options.source_path || options.sourcePath
+    ? store.db
+      .prepare("SELECT * FROM architecture_documents WHERE source_path = ? ORDER BY section_index")
+      .all(options.source_path || options.sourcePath)
+    : store.db.prepare("SELECT * FROM architecture_documents ORDER BY source_path, section_index").all();
+  return rows.map((row) => formatArchitectureDocument(row));
+}
+
+function getArchitectureDocument(store, options) {
+  const sourcePath = String(options.source_path || options.sourcePath || options.positionals?.[0] || "").trim();
+  const sectionIndex = Number(options.section_index ?? options.sectionIndex ?? options.positionals?.[1] ?? 0);
+  if (!sourcePath) throw new Error("source_path가 필요합니다.");
+  if (!Number.isInteger(sectionIndex) || sectionIndex < 0) {
+    throw new Error("section_index는 0 이상의 정수여야 합니다.");
+  }
+  const row = store.db
+    .prepare("SELECT * FROM architecture_documents WHERE source_path = ? AND section_index = ?")
+    .get(sourcePath, sectionIndex);
+  if (!row) throw new Error(`문서를 찾을 수 없습니다: ${sourcePath}#${sectionIndex}`);
+  return formatArchitectureDocument(row);
+}
+
+function deleteArchitectureDocument(store, options) {
+  const sourcePath = String(options.source_path || options.sourcePath || options.positionals?.[0] || "").trim();
+  const sectionIndex = Number(options.section_index ?? options.sectionIndex ?? options.positionals?.[1] ?? 0);
+  if (!sourcePath) throw new Error("source_path가 필요합니다.");
+  if (!Number.isInteger(sectionIndex) || sectionIndex < 0) {
+    throw new Error("section_index는 0 이상의 정수여야 합니다.");
+  }
+  const result = store.db
+    .prepare("DELETE FROM architecture_documents WHERE source_path = ? AND section_index = ?")
+    .run(sourcePath, sectionIndex);
+  return { source_path: sourcePath, section_index: sectionIndex, deleted: result.changes > 0 };
+}
+
+function normalizeChangeDate(value) {
+  const changeDate = String(value || new Date().toISOString().slice(0, 10)).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(changeDate)) {
+    throw new Error(`change_date는 YYYY-MM-DD 형식이어야 합니다: ${changeDate}`);
+  }
+  return changeDate;
+}
+
+function recordChange(store, options) {
+  const summary = String(options.summary || options.positionals?.join(" ") || "").trim();
+  if (!summary) throw new Error("summary가 필요합니다.");
+  const issueId = options.issue_id || options.issueId || options.issue || null;
+  if (issueId) validateIssueId(issueId);
+  const changeDate = normalizeChangeDate(options.change_date || options.changeDate || options.date);
+  const createdAt = now();
+  const result = store.db
+    .prepare(
+      "INSERT INTO change_log (change_date, summary, issue_id, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .run(changeDate, summary, issueId, createdAt);
+  return store.db.prepare("SELECT * FROM change_log WHERE id = ?").get(result.lastInsertRowid);
+}
+
+function listChanges(store, options) {
+  const clauses = [];
+  const values = [];
+  const issueId = options.issue_id || options.issueId || options.issue;
+  if (issueId) {
+    validateIssueId(issueId);
+    clauses.push("issue_id = ?");
+    values.push(issueId);
+  }
+  if (options.date || options.change_date || options.changeDate) {
+    clauses.push("change_date = ?");
+    values.push(normalizeChangeDate(options.date || options.change_date || options.changeDate));
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  return store.db
+    .prepare(`SELECT * FROM change_log ${where} ORDER BY change_date DESC, id DESC`)
+    .all(...values);
 }
 
 function searchArchitectureDocuments(store, options) {
@@ -738,157 +738,6 @@ function reembedFailed(store, options) {
   return results;
 }
 
-function sectionBody(markdown, heading) {
-  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`## ${escaped}\\n([\\s\\S]*?)(?=\\n## [^\\n]+\\n|$)`, "i");
-  return markdown.match(pattern)?.[1]?.trim() || "";
-}
-
-function extractTaskIds(markdown, heading) {
-  return [...sectionBody(markdown, heading).matchAll(/-\s*(T-\d{3})\b/g)].map((match) => match[1]);
-}
-
-function inferStatus(filePath, raw) {
-  if (filePath.includes(`${path.sep}archive${path.sep}`)) return "done";
-  if (filePath.endsWith(`${path.sep}current.md`)) return "current";
-  const match = raw.match(/\*\*Status:\*\*\s*(backlog|in-progress|done)\b/i);
-  const value = match?.[1]?.toLowerCase();
-  return value === "in-progress" ? "current" : value || "backlog";
-}
-
-function parseMarkdownFile(filePath) {
-  if (!fs.existsSync(filePath)) return [];
-  const text = fs.readFileSync(filePath, "utf8");
-  const headers = [...text.matchAll(/^###\s+(T-\d{3})\s+(?:\[([^\]]+)\]\s+)?(.+?)\s*$/gm)];
-  return headers.map((header, index) => {
-    const start = header.index || 0;
-    const end = headers[index + 1]?.index || text.length;
-    const raw = text.slice(start, end).trim();
-    return {
-      issue_id: header[1],
-      triage_label: header[2] || null,
-      title: header[3].trim(),
-      status: inferStatus(filePath, raw),
-      body: raw,
-      source_file: filePath,
-      parent_issue_id: extractTaskIds(raw, "Parent")[0] || null,
-      blockedBy: extractTaskIds(raw, "Blocked by"),
-    };
-  });
-}
-
-function markdownIssueFiles(root) {
-  const tasks = path.join(root, "docs", "tasks");
-  const files = [];
-  for (const relative of ["backlog.md", "current.md"]) {
-    const filePath = path.join(tasks, relative);
-    if (fs.existsSync(filePath)) files.push(filePath);
-  }
-  const archive = path.join(tasks, "archive");
-  if (fs.existsSync(archive)) {
-    const walk = (directory) => {
-      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-        const filePath = path.join(directory, entry.name);
-        if (entry.isDirectory()) walk(filePath);
-        else if (entry.isFile() && entry.name.endsWith(".md")) files.push(filePath);
-      }
-    };
-    walk(archive);
-  }
-  return files.sort();
-}
-
-function migrate(store, options) {
-  const sourceFiles = markdownIssueFiles(options.root);
-  emitProgress(`Markdown 이슈 ${sourceFiles.length}개 파일을 읽습니다.`);
-  const parsed = sourceFiles.flatMap(parseMarkdownFile);
-  const unique = new Map(parsed.map((issue) => [issue.issue_id, issue]));
-  const candidates = [...unique.values()].filter((issue) => !issueRow(store.db, issue.issue_id));
-  emitProgress(
-    `마이그레이션 대상 ${candidates.length}개 이슈를 찾았습니다 (${unique.size - candidates.length}개는 이미 저장됨).`,
-  );
-  const pending = [];
-  const labels = candidates.map(
-    (issue) => `${path.relative(options.root, issue.source_file)} → ${issue.issue_id} (${issue.title})`,
-  );
-  let embeddings = [];
-  if (candidates.length > 0) {
-    emitProgress(`임베딩 사전 검증을 시작합니다: ${candidates.length}개 이슈를 한 프로세스로 처리합니다.`);
-    try {
-      embeddings = createEmbeddings(
-        options.root,
-        candidates.map((issue) => bodyForEmbedding(issue)),
-        options.embeddingCommand,
-        labels,
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`마이그레이션을 중단했습니다. 임베딩 사전 검증에 실패했습니다: ${message}`);
-    }
-  }
-  for (const [index, issue] of candidates.entries()) {
-    pending.push({ issue, embedding: embeddings[index] });
-    emitProgress(`[임베딩 ${index + 1}/${candidates.length}] ${labels[index]} 완료`);
-  }
-
-  const migrated = [];
-  const skipped = [];
-  for (const issue of unique.values()) {
-    if (issueRow(store.db, issue.issue_id)) {
-      skipped.push(issue.issue_id);
-      emitProgress(`${path.relative(options.root, issue.source_file)} → ${issue.issue_id}는 이미 SQLite에 있어 건너뜁니다.`);
-      continue;
-    }
-    const prepared = pending.find((item) => item.issue.issue_id === issue.issue_id);
-    emitProgress(
-      `[SQLite 저장 ${migrated.length + 1}/${candidates.length}] ${path.relative(options.root, issue.source_file)} → ${issue.issue_id} 시작`,
-    );
-    migrated.push(insertIssue(store, issue, options, issue.issue_id, prepared.embedding));
-    emitProgress(
-      `[SQLite 저장 ${migrated.length}/${candidates.length}] ${path.relative(options.root, issue.source_file)} → ${issue.issue_id} 완료`,
-    );
-  }
-  emitProgress(`Markdown 마이그레이션 완료: ${migrated.length}개 저장, ${skipped.length}개 건너뜀.`);
-  return { migrated, skipped, source_files: sourceFiles.map((file) => path.relative(options.root, file)) };
-}
-
-function pruneMigratedMarkdown(store, options) {
-  const sourceFiles = markdownIssueFiles(options.root);
-  const parsed = sourceFiles.flatMap(parseMarkdownFile);
-  const unique = new Map(parsed.map((issue) => [issue.issue_id, issue]));
-  const missing = [...unique.keys()].filter((issueId) => !issueRow(store.db, issueId));
-  if (missing.length > 0) {
-    throw new Error(`SQLite에 없는 Markdown 이슈가 있어 축약을 중단합니다: ${missing.join(", ")}`);
-  }
-  if (!options.yes) {
-    throw new Error("Markdown 축약은 데이터 손실을 수반하므로 --yes 확인이 필요합니다.");
-  }
-
-  const pruned = [];
-  for (const filePath of sourceFiles) {
-    const original = fs.readFileSync(filePath, "utf8");
-    if (!/^###\s+T-\d{3}\b/m.test(original)) continue;
-    const firstIssue = original.search(/^###\s+T-\d{3}\b/m);
-    const preamble = firstIssue >= 0 ? original.slice(0, firstIssue).trimEnd() : "";
-    const title = preamble || `# ${path.basename(filePath, ".md")}`;
-    const replacement = [
-      title,
-      "",
-      "> 이 파일의 T-### 이슈 source of truth는 `docs/issues.sqlite`입니다.",
-      "> 기존 Markdown 본문은 SQLite로 마이그레이션되었으며 Git history에서 확인할 수 있습니다.",
-      "> 새 이슈 발행·조회·상태 변경은 agent 설치 위치의 `scripts/issue-store.js` CLI에 `--root`를 넘겨 수행하세요.",
-      "",
-    ].join("\n");
-    fs.writeFileSync(filePath, replacement, "utf8");
-    pruned.push(path.relative(options.root, filePath));
-  }
-  emitProgress(`마이그레이션된 Markdown ${pruned.length}개 파일을 source-of-truth 안내문으로 축약했습니다.`);
-  return {
-    pruned_files: pruned,
-    issue_count: unique.size,
-  };
-}
-
 function listIssues(store, options) {
   emitProgress("SQLite 이슈 목록을 읽습니다.");
   const clauses = [];
@@ -987,47 +836,21 @@ function fail(error) {
   process.exitCode = 1;
 }
 
-function removeDatabaseFiles(dbPath) {
-  for (const suffix of ["", "-wal", "-shm"]) {
-    try {
-      fs.rmSync(`${dbPath}${suffix}`, { force: true });
-    } catch {
-      // Best effort cleanup after a failed first migration.
-    }
-  }
-}
-
 function run(argv = process.argv.slice(2)) {
   const parsed = parseArgs(argv);
   const command = parsed.command;
   const root = path.resolve(parsed.root || process.cwd());
   const dbPath = resolveDbPath(root, parsed.db);
-  const databaseExistedBefore = fs.existsSync(dbPath);
   let store;
   try {
     if (command === "help") {
-      print({ ok: true, commands: ["init", "migrate", "index-architecture", "prune-migrated", "create", "get", "list", "update-status", "search", "search-architecture", "reembed-failed"] });
+      print({ ok: true, commands: ["init", "create", "get", "list", "update-status", "search", "put-architecture", "get-architecture", "list-architecture", "delete-architecture", "search-architecture", "record-change", "list-changes", "reembed-failed"] });
       return;
     }
     store = openStore(dbPath);
     const options = optionsWithPayload({ ...parsed, root });
     if (command === "init") {
-      print({ ok: true, command, db_path: dbPath, vector: { loaded: true, version: store.vectorVersion, dimension: VECTOR_DIMENSION }, schema: ["issues", "issue_blockers", "architecture_documents"] });
-      return;
-    }
-    if (command === "migrate") {
-      const result = migrate(store, options);
-      print({ ok: true, command, ...result, count: result.migrated.length, issues: result.migrated });
-      return;
-    }
-    if (command === "index-architecture") {
-      const result = indexArchitectureDocuments(store, options);
-      print({ ok: true, command, ...result });
-      return;
-    }
-    if (command === "prune-migrated") {
-      const result = pruneMigratedMarkdown(store, options);
-      print({ ok: true, command, ...result });
+      print({ ok: true, command, db_path: dbPath, vector: { loaded: true, version: store.vectorVersion, dimension: VECTOR_DIMENSION }, schema: ["issues", "issue_blockers", "architecture_documents", "change_log"] });
       return;
     }
     if (command === "create") {
@@ -1061,9 +884,36 @@ function run(argv = process.argv.slice(2)) {
       print({ ok: true, command, query: options.query || options.q || options.positionals[0], count: results.length, results });
       return;
     }
+    if (command === "put-architecture") {
+      const document = putArchitectureDocument(store, options);
+      print({ ok: true, command, document });
+      return;
+    }
+    if (command === "get-architecture") {
+      print({ ok: true, command, document: getArchitectureDocument(store, options) });
+      return;
+    }
+    if (command === "list-architecture") {
+      const documents = listArchitectureDocuments(store, options);
+      print({ ok: true, command, count: documents.length, documents });
+      return;
+    }
+    if (command === "delete-architecture") {
+      print({ ok: true, command, ...deleteArchitectureDocument(store, options) });
+      return;
+    }
     if (command === "search-architecture") {
       const results = searchArchitectureDocuments(store, options);
       print({ ok: true, command, query: options.query || options.q || options.positionals[0], count: results.length, results });
+      return;
+    }
+    if (command === "record-change") {
+      print({ ok: true, command, change: recordChange(store, options) });
+      return;
+    }
+    if (command === "list-changes") {
+      const changes = listChanges(store, options);
+      print({ ok: true, command, count: changes.length, changes });
       return;
     }
     if (command === "reembed-failed") {
@@ -1073,7 +923,6 @@ function run(argv = process.argv.slice(2)) {
     }
     throw new Error(`알 수 없는 명령입니다: ${command}`);
   } catch (error) {
-    if (command === "migrate" && !databaseExistedBefore) removeDatabaseFiles(dbPath);
     fail(error);
   } finally {
     closeStore(store);
@@ -1086,17 +935,17 @@ module.exports = {
   VECTOR_DIMENSION,
   SCHEMA_SQL,
   parseArgs,
-  parseMarkdownFile,
   defaultEmbeddingPythonCandidates,
   chooseEmbeddingCommand: embeddingCommand,
   parseEmbeddingOutput,
   bodyForEmbedding,
-  architectureDocumentFiles,
-  architectureSections,
-  architectureChunks,
-  indexArchitectureDocuments,
   searchArchitectureDocuments,
-  pruneMigratedMarkdown,
+  putArchitectureDocument,
+  getArchitectureDocument,
+  listArchitectureDocuments,
+  deleteArchitectureDocument,
+  recordChange,
+  listChanges,
   openStore,
   closeStore,
   run,

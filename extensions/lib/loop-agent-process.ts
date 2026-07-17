@@ -1,0 +1,455 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+export type StreamingRunResult = {
+  code: number;
+  finalText: string;
+  stderr: string;
+};
+
+type JsonTextContent = { type?: string; text?: string };
+type JsonAssistantMessage = {
+  role?: string;
+  stopReason?: string;
+  errorMessage?: string;
+  content?: string | JsonTextContent[];
+};
+
+export type ParsedEventLine = {
+  log?: string;
+  status?: string;
+};
+
+export type EventParseState = {
+  finalText: string;
+  toolNames: Map<string, string>;
+  assistantBuffer: string;
+  errorMessage: string | null;
+};
+
+export type PiProcessRuntime = {
+  runPiCommandWithProgress(
+    pi: Pick<ExtensionAPI, "sendMessage">,
+    cwd: string,
+    ui: Pick<ExtensionContext["ui"], "setStatus">,
+    label: string,
+    args: string[],
+    timeoutMs?: number,
+    isIdle?: () => boolean,
+  ): Promise<StreamingRunResult>;
+  killActiveChildren(): number;
+};
+
+function shortenStatusLine(text: string, maxLength = 120): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= maxLength) return collapsed;
+  return `${collapsed.slice(0, maxLength - 1)}…`;
+}
+
+function joinAssistantText(message: JsonAssistantMessage): string {
+  const content = message.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter(
+      (part): part is JsonTextContent =>
+        part?.type === "text" && typeof part.text === "string",
+    )
+    .map((part) => part.text as string)
+    .join("");
+}
+
+function extractFinalTextFromMessages(messages: JsonAssistantMessage[]): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== "assistant") continue;
+    return joinAssistantText(message).trim();
+  }
+  return "";
+}
+
+function summarizeToolArgs(args: unknown): string {
+  if (args == null) return "";
+  if (typeof args === "string") return shortenStatusLine(args, 60);
+  if (typeof args !== "object") return shortenStatusLine(String(args), 60);
+
+  const record = args as Record<string, unknown>;
+  for (const key of [
+    "command",
+    "path",
+    "file_path",
+    "filePath",
+    "pattern",
+    "query",
+    "url",
+    "cmd",
+  ]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return shortenStatusLine(value, 60);
+    }
+  }
+  try {
+    return shortenStatusLine(JSON.stringify(args), 60);
+  } catch {
+    return "";
+  }
+}
+
+function summarizeToolResult(result: unknown): string {
+  if (result == null) return "";
+  if (typeof result === "string") return shortenStatusLine(result, 60);
+  if (typeof result === "object") {
+    const record = result as Record<string, unknown>;
+    if (Array.isArray(record.content)) {
+      const text = record.content
+        .filter(
+          (part): part is JsonTextContent =>
+            (part as JsonTextContent)?.type === "text" &&
+            typeof (part as JsonTextContent).text === "string",
+        )
+        .map((part) => part.text as string)
+        .join(" ");
+      if (text.trim()) return shortenStatusLine(text, 60);
+    }
+    try {
+      return shortenStatusLine(JSON.stringify(result), 60);
+    } catch {
+      return "";
+    }
+  }
+  return shortenStatusLine(String(result), 60);
+}
+
+export function handleJsonEvent(
+  event: Record<string, unknown>,
+  parse: EventParseState,
+): ParsedEventLine {
+  const type = typeof event.type === "string" ? event.type : "";
+
+  switch (type) {
+    case "tool_execution_start": {
+      const toolName =
+        typeof event.toolName === "string" ? event.toolName : "tool";
+      const toolCallId =
+        typeof event.toolCallId === "string" ? event.toolCallId : "";
+      if (toolCallId) parse.toolNames.set(toolCallId, toolName);
+      const argsSummary = summarizeToolArgs(event.args);
+      const line = argsSummary
+        ? `🔧 ${toolName}: ${argsSummary}`
+        : `🔧 ${toolName}`;
+      return { log: line, status: line };
+    }
+    case "tool_execution_update": {
+      const toolName =
+        typeof event.toolName === "string" ? event.toolName : "tool";
+      const partial = summarizeToolResult(event.partialResult);
+      return partial ? { status: `⏳ ${toolName}: ${partial}` } : {};
+    }
+    case "tool_execution_end": {
+      const toolCallId =
+        typeof event.toolCallId === "string" ? event.toolCallId : "";
+      const toolName =
+        (typeof event.toolName === "string" && event.toolName) ||
+        parse.toolNames.get(toolCallId) ||
+        "tool";
+      const resultSummary = summarizeToolResult(event.result);
+      const line = `${event.isError === true ? "❌" : "✅"} ${toolName}${
+        resultSummary ? ` → ${resultSummary}` : ""
+      }`;
+      return { log: line, status: line };
+    }
+    case "message_update": {
+      const assistantMessageEvent = event.assistantMessageEvent as
+        | { type?: string; delta?: string; content?: string; error?: JsonAssistantMessage }
+        | undefined;
+      if (!assistantMessageEvent || typeof assistantMessageEvent.type !== "string") {
+        return {};
+      }
+      if (
+        assistantMessageEvent.type === "text_delta" &&
+        typeof assistantMessageEvent.delta === "string"
+      ) {
+        parse.assistantBuffer += assistantMessageEvent.delta;
+        return {
+          status: `💬 ${shortenStatusLine(parse.assistantBuffer, 60)}`,
+        };
+      }
+      if (
+        assistantMessageEvent.type === "text_end" &&
+        typeof assistantMessageEvent.content === "string"
+      ) {
+        parse.assistantBuffer = "";
+        const text = assistantMessageEvent.content.trim();
+        return text ? { log: `💬 ${shortenStatusLine(text, 100)}` } : {};
+      }
+      if (assistantMessageEvent.type === "error") {
+        const message = assistantMessageEvent.error?.errorMessage || "요청 오류";
+        parse.errorMessage = message;
+        return { log: `⚠️ ${shortenStatusLine(message, 100)}` };
+      }
+      return {};
+    }
+    case "message_end":
+    case "turn_end": {
+      const message = (event.message ?? {}) as JsonAssistantMessage;
+      if (message.role === "assistant") {
+        const text = joinAssistantText(message).trim();
+        if (text) parse.finalText = text;
+        if (message.stopReason === "error" || message.stopReason === "aborted") {
+          parse.errorMessage =
+            message.errorMessage || `요청이 ${message.stopReason} 상태로 종료됨`;
+        }
+      }
+      return {};
+    }
+    case "agent_end": {
+      const messages = Array.isArray(event.messages)
+        ? (event.messages as JsonAssistantMessage[])
+        : [];
+      const text = extractFinalTextFromMessages(messages);
+      if (text) parse.finalText = text;
+      return {};
+    }
+    default:
+      return {};
+  }
+}
+
+function formatProgressMessage(
+  label: string,
+  stream: "stdout" | "stderr" | "heartbeat",
+  transcript: string[],
+  details?: string,
+): string {
+  const lines = [
+    `## ${label} 진행 로그`,
+    "",
+    `- 최신 상태: ${stream}`,
+    `- 누적 로그: ${transcript.length}줄`,
+  ];
+  if (details) lines.push(`- 상세: ${details}`);
+  lines.push("", transcript.slice(-8).join("\n") || "(아직 출력 없음)");
+  return lines.join("\n");
+}
+
+function withJsonMode(args: string[]): string[] {
+  const result = [...args];
+  const modeIndex = result.indexOf("--mode");
+  if (modeIndex >= 0 && modeIndex + 1 < result.length) {
+    result[modeIndex + 1] = "json";
+    return result;
+  }
+  return ["--mode", "json", ...result];
+}
+
+export function createPiProcessRuntime({
+  spawnProcess = spawn,
+  registerExitHandler = true,
+}: {
+  spawnProcess?: typeof spawn;
+  registerExitHandler?: boolean;
+} = {}): PiProcessRuntime {
+  const activeChildren = new Set<ChildProcess>();
+  const activeChildStatuses = new Map<string, string>();
+
+  const renderActiveChildStatuses = (): string | undefined => {
+    if (activeChildStatuses.size === 0) return undefined;
+    return Array.from(activeChildStatuses.entries())
+      .map(([label, status]) => `${label}: ${status}`)
+      .join(" | ");
+  };
+
+  const setChildStatus = (
+    ui: Pick<ExtensionContext["ui"], "setStatus">,
+    label: string,
+    status: string,
+  ): void => {
+    activeChildStatuses.set(label, status);
+    ui.setStatus("loop-agent", renderActiveChildStatuses());
+  };
+
+  const clearChildStatus = (
+    ui: Pick<ExtensionContext["ui"], "setStatus">,
+    label: string,
+  ): void => {
+    activeChildStatuses.delete(label);
+    ui.setStatus("loop-agent", renderActiveChildStatuses());
+  };
+
+  const killActiveChildren = (): number => {
+    let killed = 0;
+    for (const child of activeChildren) {
+      child.kill("SIGTERM");
+      killed += 1;
+    }
+    activeChildren.clear();
+    activeChildStatuses.clear();
+    return killed;
+  };
+
+  if (registerExitHandler) {
+    process.once("exit", () => {
+      for (const child of activeChildren) child.kill("SIGTERM");
+    });
+  }
+
+  const runPiCommandWithProgress = async (
+    pi: Pick<ExtensionAPI, "sendMessage">,
+    cwd: string,
+    ui: Pick<ExtensionContext["ui"], "setStatus">,
+    label: string,
+    args: string[],
+    timeoutMs?: number,
+    isIdle?: () => boolean,
+  ): Promise<StreamingRunResult> => {
+    setChildStatus(ui, label, "시작");
+
+    return await new Promise<StreamingRunResult>((resolve, reject) => {
+      const child = spawnProcess("pi", withJsonMode(args), {
+        cwd,
+        env: { ...process.env, LOOP_AGENT_CHILD: "1" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      activeChildren.add(child);
+
+      let stderr = "";
+      const progressTranscript: string[] = [];
+      let stdoutRemainder = "";
+      let stderrRemainder = "";
+      let lastActivity = Date.now();
+      let finished = false;
+      let timedOut = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let heartbeat: ReturnType<typeof setInterval> | undefined;
+      const parse: EventParseState = {
+        finalText: "",
+        toolNames: new Map(),
+        assistantBuffer: "",
+        errorMessage: null,
+      };
+
+      const clearStatus = (): void => clearChildStatus(ui, label);
+      const finish = (result: StreamingRunResult): void => {
+        if (finished) return;
+        finished = true;
+        activeChildren.delete(child);
+        if (heartbeat !== undefined) clearInterval(heartbeat);
+        if (timer !== undefined) clearTimeout(timer);
+        clearStatus();
+        resolve(result);
+      };
+      const fail = (error: Error): void => {
+        if (finished) return;
+        finished = true;
+        activeChildren.delete(child);
+        if (heartbeat !== undefined) clearInterval(heartbeat);
+        if (timer !== undefined) clearTimeout(timer);
+        clearStatus();
+        reject(error);
+      };
+      const emit = (
+        parsed: ParsedEventLine,
+        stream: "stdout" | "stderr" = "stdout",
+      ): void => {
+        if (parsed.status) setChildStatus(ui, label, parsed.status);
+        if (!parsed.log) return;
+        progressTranscript.push(parsed.log);
+        if (isIdle && !isIdle()) return;
+        pi.sendMessage(
+          {
+            customType: "loop-agent-progress",
+            content: formatProgressMessage(label, stream, progressTranscript),
+            display: true,
+            details: { label, stream, lines: progressTranscript.length },
+          },
+          { triggerTurn: false },
+        );
+      };
+      const ingestStdout = (chunk: string): void => {
+        lastActivity = Date.now();
+        const parts = (stdoutRemainder + chunk).split(/\r?\n/);
+        stdoutRemainder = parts.pop() ?? "";
+        for (const raw of parts) {
+          const line = raw.trim();
+          if (!line) continue;
+          try {
+            emit(handleJsonEvent(JSON.parse(line) as Record<string, unknown>, parse));
+          } catch {
+            emit({ log: shortenStatusLine(line, 200) });
+          }
+        }
+      };
+      const ingestStderr = (chunk: string): void => {
+        lastActivity = Date.now();
+        const parts = (stderrRemainder + chunk).split(/\r?\n/);
+        stderrRemainder = parts.pop() ?? "";
+        for (const raw of parts) {
+          const line = raw.trim();
+          if (line) {
+            emit({ log: `[stderr] ${shortenStatusLine(line, 200)}` }, "stderr");
+          }
+        }
+      };
+
+      heartbeat = setInterval(() => {
+        if (finished || (isIdle && !isIdle())) return;
+        const elapsedSeconds = Math.max(1, Math.floor((Date.now() - lastActivity) / 1000));
+        pi.sendMessage(
+          {
+            customType: "loop-agent-progress",
+            content: formatProgressMessage(
+              label,
+              "heartbeat",
+              progressTranscript,
+              `${elapsedSeconds}초 동안 새 출력 없음`,
+            ),
+            display: true,
+            details: { label, stream: "heartbeat", lines: progressTranscript.length, elapsedSeconds },
+          },
+          { triggerTurn: false },
+        );
+      }, 5000);
+
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGTERM");
+          setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+          setChildStatus(ui, label, "시간 초과, 종료 중");
+        }, timeoutMs);
+      }
+      child.stdout?.on("data", (chunk: Buffer) => ingestStdout(chunk.toString("utf8")));
+      child.stderr?.on("data", (chunk: Buffer) => {
+        const text = chunk.toString("utf8");
+        stderr += text;
+        ingestStderr(text);
+      });
+      child.once("error", (error) => fail(error instanceof Error ? error : new Error(String(error))));
+      child.once("close", (code, signal) => {
+        if (timedOut) {
+          fail(new Error(`${label} 실행이 ${Math.floor((timeoutMs ?? 0) / 1000)}초 제한을 넘겨 종료되었습니다.`));
+          return;
+        }
+        const stdoutTail = stdoutRemainder.trim();
+        if (stdoutTail) {
+          try {
+            emit(handleJsonEvent(JSON.parse(stdoutTail) as Record<string, unknown>, parse));
+          } catch {
+            emit({ log: shortenStatusLine(stdoutTail, 200) });
+          }
+        }
+        const stderrTail = stderrRemainder.trim();
+        if (stderrTail) emit({ log: `[stderr] ${shortenStatusLine(stderrTail, 200)}` }, "stderr");
+        const exitCode = code ?? (signal ? 1 : 0);
+        finish({
+          code: exitCode !== 0 ? exitCode : parse.errorMessage ? 1 : 0,
+          finalText: parse.finalText.trim(),
+          stderr: (parse.errorMessage ? `${parse.errorMessage}\n${stderr}` : stderr).trim(),
+        });
+      });
+    });
+  };
+
+  return { runPiCommandWithProgress, killActiveChildren };
+}

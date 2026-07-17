@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -119,6 +119,13 @@ export function resolveCodegraphCli(config: McpConfig): CommandInvocation | unde
   const adjacentCli = join(dirname(command), executableName);
   if (existsSync(adjacentCli)) {
     return { command: adjacentCli, argsPrefix: [] };
+  }
+
+  // MCP 설정은 PATH의 실행 파일 이름만으로도 유효할 수 있다. 이 경우
+  // 자식 프로세스가 상속한 PATH에서 직접 해석하게 두어 특정 사용자 홈이나
+  // Node 버전에 묶이지 않도록 한다.
+  if (!isAbsolute(command) && !command.includes("/") && !command.includes("\\")) {
+    return { command, argsPrefix: [] };
   }
 
   return undefined;

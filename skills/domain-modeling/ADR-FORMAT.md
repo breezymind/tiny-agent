@@ -1,12 +1,14 @@
-# ADR Format
+# SQLite ADR Record Format
 
-ADRs live in `docs/adr/` and use sequential numbering: `0001-slug.md`, `0002-slug.md`, etc.
+ADRs are append-only records in the project's `architecture_documents` SQLite table with `doc_type=adr`. Use sequential logical keys such as `adr/0001-slug`, `adr/0002-slug`; these are record keys, not Markdown paths.
 
-Create the `docs/adr/` directory lazily — only when the first ADR is needed.
+Create a record lazily — only when the first ADR is needed. Use `put-architecture` and never modify the SQLite file directly.
 
 ## Template
 
-```md
+Store this body in the record:
+
+```text
 # {Short title of the decision}
 
 {1-3 sentences: what's the context, what did we decide, and why.}
@@ -24,7 +26,7 @@ Only include these when they add genuine value. Most ADRs won't need them.
 
 ## Numbering
 
-Scan `docs/adr/` for the highest existing number and increment by one.
+Use `list-architecture` with `doc_type=adr` or the existing logical keys to find the highest number and increment by one.
 
 ## When to offer an ADR
 

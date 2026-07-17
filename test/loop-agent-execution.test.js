@@ -1,0 +1,337 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { pathToFileURL } = require("node:url");
+
+const LOOP_AGENT = path.join(__dirname, "..", "extensions", "loop-agent.ts");
+
+function writeExecutable(filePath, source) {
+  fs.writeFileSync(filePath, source, { mode: 0o755 });
+  fs.chmodSync(filePath, 0o755);
+}
+
+function createFakePiRuntime({ maxRounds = 2, reviewMode = "pass" } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "loop-agent-execution-"));
+  const agentDir = path.join(root, "agent");
+  const binDir = path.join(root, "bin");
+  const projectRoot = path.join(root, "project");
+  fs.mkdirSync(agentDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(projectRoot, { recursive: true });
+  fs.writeFileSync(
+    path.join(agentDir, "settings.json"),
+    JSON.stringify({ loopAgent: { maxImprovementRounds: maxRounds } }),
+  );
+
+  const reviewStatePath = path.join(root, "review-count");
+  const fakePiPath = path.join(binDir, "pi");
+  writeExecutable(
+    fakePiPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const prompt = process.argv.at(-1) || "";
+const reviewStatePath = process.env.FAKE_PI_REVIEW_STATE;
+const mode = process.env.FAKE_PI_REVIEW_MODE || "pass";
+let text = "fake coding agent completed";
+if (prompt.includes("테스트 실패 원인 분석 에이전트")) {
+  text = [
+    "<!-- grill-review:start -->",
+    JSON.stringify({
+      overall: "FAIL",
+      failedItems: [{
+        item: "결정적 검증 명령",
+        reason: "fixture failure requires a code change",
+        evidence: "fake Pi runtime",
+      }],
+    }),
+    "<!-- grill-review:end -->",
+  ].join("\\n");
+} else if (prompt.includes("검수 체크리스트:")) {
+  let count = 0;
+  if (reviewStatePath) {
+    count = Number(fs.existsSync(reviewStatePath) ? fs.readFileSync(reviewStatePath, "utf8") : "0");
+    fs.writeFileSync(reviewStatePath, String(count + 1));
+  }
+  const shouldFail = mode === "always-fail" || (mode === "fail-once" && count === 0);
+  text = shouldFail
+    ? [
+        "<!-- grill-review:start -->",
+        JSON.stringify({
+          overall: "FAIL",
+          failedItems: [{
+            item: "fixture checklist",
+            reason: "fake review requires an improvement round",
+            evidence: "fake Pi runtime",
+          }],
+        }),
+        "<!-- grill-review:end -->",
+      ].join("\\n")
+    : [
+        "<!-- grill-review:start -->",
+        JSON.stringify({ overall: "PASS", failedItems: [] }),
+        "<!-- grill-review:end -->",
+      ].join("\\n");
+}
+process.stdout.write(JSON.stringify({
+  type: "agent_end",
+  messages: [{ role: "assistant", content: [{ type: "text", text }] }],
+}) + "\\n");
+`,
+  );
+
+  const entries = [];
+  const messages = [];
+  const notifications = [];
+  const statuses = [];
+  const pi = {
+    appendEntry(type, payload) {
+      entries.push({ type, payload });
+    },
+    sendMessage(message, options) {
+      messages.push({ message, options });
+    },
+  };
+  const ctx = {
+    cwd: projectRoot,
+    isIdle: () => true,
+    model: { provider: "fake", id: "fake" },
+    ui: {
+      notify(message, level) {
+        notifications.push({ message, level });
+      },
+      setStatus(label, message) {
+        statuses.push({ label, message });
+      },
+    },
+  };
+
+  return {
+    root,
+    agentDir,
+    binDir,
+    projectRoot,
+    reviewStatePath,
+    pi,
+    ctx,
+    entries,
+    messages,
+    notifications,
+    statuses,
+    cleanup() {
+      fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+async function loadLoopAgent(runtime) {
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = runtime.agentDir;
+  try {
+    const imported = await import(`${pathToFileURL(LOOP_AGENT).href}?execution-test=${Math.random()}`);
+    return imported.default ?? imported;
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
+}
+
+async function runWorkflow(runtime, { verificationScript, reviewMode = "pass", checklist = "fixture checklist" } = {}) {
+  const previousPath = process.env.PATH;
+  const previousVerification = process.env.PI_VERIFICATION_COMMANDS;
+  const previousReviewMode = process.env.FAKE_PI_REVIEW_MODE;
+  const previousReviewState = process.env.FAKE_PI_REVIEW_STATE;
+  process.env.PATH = `${runtime.binDir}${path.delimiter}${previousPath || ""}`;
+  process.env.PI_VERIFICATION_COMMANDS = JSON.stringify([
+    {
+      program: process.execPath,
+      args: [verificationScript],
+      cwd: runtime.projectRoot,
+      timeoutMs: 5000,
+      required: true,
+    },
+  ]);
+  process.env.FAKE_PI_REVIEW_MODE = reviewMode;
+  process.env.FAKE_PI_REVIEW_STATE = runtime.reviewStatePath;
+
+  try {
+    const module = await loadLoopAgent(runtime);
+    const workflowId = module.reserveWorkflow(true, "awaiting-execution", checklist);
+    await module.runExecutionReviewLoop(runtime.pi, runtime.ctx, workflowId, "initial coding prompt");
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (previousVerification === undefined) delete process.env.PI_VERIFICATION_COMMANDS;
+    else process.env.PI_VERIFICATION_COMMANDS = previousVerification;
+    if (previousReviewMode === undefined) delete process.env.FAKE_PI_REVIEW_MODE;
+    else process.env.FAKE_PI_REVIEW_MODE = previousReviewMode;
+    if (previousReviewState === undefined) delete process.env.FAKE_PI_REVIEW_STATE;
+    else process.env.FAKE_PI_REVIEW_STATE = previousReviewState;
+  }
+}
+
+function createVerificationScript(runtime, mode) {
+  const scriptPath = path.join(runtime.projectRoot, "verification.js");
+  const attemptsPath = path.join(runtime.root, "verification-attempts");
+  fs.writeFileSync(
+    scriptPath,
+    `const fs = require("node:fs");
+const path = ${JSON.stringify(attemptsPath)};
+const attempts = Number(fs.existsSync(path) ? fs.readFileSync(path, "utf8") : "0") + 1;
+fs.writeFileSync(path, String(attempts));
+process.exit(${JSON.stringify(mode)} === "fail-once" && attempts === 1 ? 1 : 0);
+`,
+  );
+  return scriptPath;
+}
+
+function stateReasons(runtime) {
+  return runtime.entries
+    .filter((entry) => entry.type === "loop-agent-state")
+    .map((entry) => entry.payload.reason);
+}
+
+function messageTypes(runtime) {
+  return runtime.messages.map(({ message }) => message.customType).filter(Boolean);
+}
+
+test("fake Pi runtime traverses coding, testing, review, and completion stages", async () => {
+  const runtime = createFakePiRuntime();
+  try {
+    const verificationScript = createVerificationScript(runtime, "pass");
+    await runWorkflow(runtime, { verificationScript });
+
+    assert.deepEqual(stateReasons(runtime), [
+      "coding-started",
+      "coding-completed",
+      "testing-started",
+      "testing-completed",
+      "review-started",
+      "completed",
+    ]);
+    assert.deepEqual(messageTypes(runtime), [
+      "loop-agent-coding-result",
+      "loop-agent-test-result",
+      "loop-agent-review",
+    ]);
+    assert.equal(runtime.entries.filter((entry) => entry.type === "loop-agent-review").length, 1);
+    assert.equal(runtime.entries.at(-1).payload.snapshot.workflowId, null);
+  } finally {
+    runtime.cleanup();
+  }
+});
+
+test("fake Pi runtime schedules a review failure for one improvement round", async () => {
+  const runtime = createFakePiRuntime({ reviewMode: "fail-once", maxRounds: 2 });
+  try {
+    const verificationScript = createVerificationScript(runtime, "pass");
+    await runWorkflow(runtime, { verificationScript, reviewMode: "fail-once" });
+
+    assert.deepEqual(stateReasons(runtime), [
+      "coding-started",
+      "coding-completed",
+      "testing-started",
+      "testing-completed",
+      "review-started",
+      "improvement-scheduled",
+      "coding-started",
+      "coding-completed",
+      "testing-started",
+      "testing-completed",
+      "review-started",
+      "completed",
+    ]);
+    const reviews = runtime.entries.filter((entry) => entry.type === "loop-agent-review");
+    assert.equal(reviews.length, 2);
+    assert.equal(reviews[0].payload.result.overall, "FAIL");
+    assert.equal(reviews[1].payload.result.overall, "PASS");
+  } finally {
+    runtime.cleanup();
+  }
+});
+
+test("fake Pi runtime stops when the review reaches the maximum round", async () => {
+  const runtime = createFakePiRuntime({ reviewMode: "always-fail" });
+  try {
+    const verificationScript = createVerificationScript(runtime, "pass");
+    await runWorkflow(runtime, { verificationScript, reviewMode: "always-fail" });
+
+    assert.deepEqual(stateReasons(runtime), [
+      "coding-started",
+      "coding-completed",
+      "testing-started",
+      "testing-completed",
+      "review-started",
+      "improvement-scheduled",
+      "coding-started",
+      "coding-completed",
+      "testing-started",
+      "testing-completed",
+      "review-started",
+      "improvement-scheduled",
+      "coding-started",
+      "coding-completed",
+      "testing-started",
+      "testing-completed",
+      "review-started",
+      "max-rounds-reached",
+    ]);
+    assert.equal(runtime.entries.filter((entry) => entry.type === "loop-agent-coding-result").length, 3);
+    assert.equal(runtime.entries.at(-1).payload.snapshot.workflowId, null);
+  } finally {
+    runtime.cleanup();
+  }
+});
+
+test("fake Pi runtime diagnoses a test failure and resumes from recovery", async () => {
+  const runtime = createFakePiRuntime({ maxRounds: 1 });
+  try {
+    const verificationScript = createVerificationScript(runtime, "fail-once");
+    await runWorkflow(runtime, { verificationScript });
+
+    assert.deepEqual(stateReasons(runtime), [
+      "coding-started",
+      "coding-completed",
+      "testing-started",
+      "testing-completed",
+      "test-failure-diagnosis-started",
+      "test-failure-improvement-scheduled",
+      "coding-started",
+      "coding-completed",
+      "testing-started",
+      "testing-completed",
+      "review-started",
+      "completed",
+    ]);
+    assert.equal(
+      runtime.entries.filter((entry) => entry.type === "loop-agent-test-result").length,
+      2,
+    );
+    assert.equal(
+      runtime.entries.filter((entry) => entry.type === "loop-agent-test-failure-diagnosis").length,
+      1,
+    );
+    assert.match(
+      runtime.notifications.map((item) => item.message).join("\n"),
+      /테스트 실패 원인을 planningModel로 분석합니다/,
+    );
+  } finally {
+    runtime.cleanup();
+  }
+});
+
+test("stale workflow IDs never enter the fake Pi runtime", async () => {
+  const runtime = createFakePiRuntime();
+  try {
+    const module = await loadLoopAgent(runtime);
+    const staleWorkflowId = module.reserveWorkflow(true, "awaiting-execution", "stale checklist");
+    module.reserveWorkflow(true, "awaiting-execution", "current checklist");
+    await module.runExecutionReviewLoop(runtime.pi, runtime.ctx, staleWorkflowId, "stale prompt");
+
+    assert.deepEqual(runtime.entries, []);
+    assert.deepEqual(runtime.messages, []);
+  } finally {
+    runtime.cleanup();
+  }
+});

@@ -52,7 +52,7 @@ Iterate until the user approves the breakdown.
 
 ### 5. Publish the issues to the issue tracker
 
-For each approved slice, publish a new issue with `AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"; node "$AGENT_DIR/scripts/issue-store.js" create --json --root "<project-root>"`, passing the issue body as stdin JSON (`title`, `label: ready-for-agent`, `status: backlog`, `parent`, `blockedBy`, and `body`). Do not append to `docs/tasks/*.md` directly. These issues are considered ready for AFK agents, so publish them with the correct triage label unless instructed otherwise.
+For each approved slice, publish a new issue with `AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"; node "$AGENT_DIR/scripts/issue-store.js" create --json --root "<project-root>"`, passing the issue body as stdin JSON (`title`, `label: ready-for-agent`, `status: backlog`, `parent`, `blockedBy`, and `body`). Do not write issue state outside the SQLite CLI. These issues are considered ready for AFK agents, so publish them with the correct triage label unless instructed otherwise.
 
 Publish issues in dependency order (blockers first) so you can reference real issue identifiers. Where the tracker supports it, link each slice to its parent as a native **sub-issue** and wire each blocker as a native **blocking edge** (mechanics in the issue-tracker doc); the `## Parent` and `## Blocked by` body sections are the fallback otherwise.
 

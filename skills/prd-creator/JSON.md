@@ -11,7 +11,7 @@ Only proceed after user confirmation.
 
 ## Task Generation Workflow
 
-You should read the PRD markdown file located in `PROJECT_ROOT/.agent/prd/PRD.md`.
+You should read the parent PRD issue from the project SQLite store with the installed `scripts/issue-store.js get` or `search` CLI. Do not expect a PRD Markdown file.
 Each task in the PRD will have a unique ID, formatted as `TASK-${ID}`.
 Use those IDs to generate the task list, except `TASK-1` is always reserved for prerequisite verification.
 
@@ -33,7 +33,7 @@ If a question can be answered by exploring the codebase, explore the codebase in
 
 Every generated task list must start with `TASK-1: Verify project prerequisites and access`.
 
-Use the `Prerequisites and Access` section from `PROJECT_ROOT/.agent/prd/PRD.md` as the source of truth. This task must verify that implementation can safely begin before feature work starts.
+Use the `Prerequisites and Access` section from the SQLite PRD issue body as the source of truth. This task must verify that implementation can safely begin before feature work starts.
 
 `TASK-1` must confirm:
 - `PROJECT_ROOT/.env.local` exists and contains placeholder entries for every required environment variable name from the PRD
@@ -67,7 +67,7 @@ Use this exact shape for the first task, adapting names and details to the PRD:
     {
       "step": 1,
       "description": "Read prerequisite requirements from the PRD",
-      "details": "Open `PROJECT_ROOT/.agent/prd/PRD.md` and review the `Prerequisites and Access` section. List required database access, MCPs, service docs, environment variable names, login/test users, and any open gaps.",
+      "details": "Fetch the parent PRD issue from `docs/issues.sqlite` with the installed issue-store CLI and review its `Prerequisites and Access` section. List required database access, MCPs, service docs, environment variable names, login/test users, and any open gaps.",
       "pass": false
     },
     {

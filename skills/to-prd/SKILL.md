@@ -16,7 +16,7 @@ The issue tracker and triage label vocabulary should have been provided to you â
 
 Check with the user that these seams match their expectations.
 
-3. Write the PRD using the template below, then publish it with `AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"; node "$AGENT_DIR/scripts/issue-store.js" create --json --root "<project-root>"` (stdin JSON with `title`, `label: ready-for-agent`, `status: backlog`, and `body`). Do not append to `docs/tasks/*.md` directly. PRDs are stored as the body of a parent `(PRD)` issue, not as a separate entity.
+3. Write the PRD using the template below, then publish it with `AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"; node "$AGENT_DIR/scripts/issue-store.js" create --json --root "<project-root>"` (stdin JSON with `title`, `label: ready-for-agent`, `status: backlog`, and `body`). Do not write issue or PRD state outside the SQLite CLI. PRDs are stored as the body of a parent `(PRD)` issue, not as a separate entity.
 
 <prd-template>
 

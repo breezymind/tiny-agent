@@ -1,5 +1,7 @@
 # PRD Creation Through Structured Questioning
 
+This file is an internal skill instruction. The project PRD itself must be stored in the SQLite issue store, not in a project Markdown file.
+
 Help beginner-level developers transform software ideas into comprehensive PRD.md files through structured questioning.
 
 ## Conversation Flow
@@ -68,7 +70,7 @@ PRD Progress:
 - [ ] Create executive summary for user validation
 - [ ] Get user confirmation to proceed
 - [ ] Research competitive landscape (if not done)
-- [ ] Generate comprehensive PRD
+- [ ] Publish comprehensive PRD body to the parent `(PRD)` SQLite issue
 - [ ] Present and gather feedback
 - [ ] Iterate based on feedback
 ```
@@ -151,7 +153,7 @@ The `Prerequisites and Access` section must include:
 - Login/test user requirements without passwords or secret values
 - Open prerequisite gaps and the user's proceed/block decision for each gap
 
-Save as: `PROJECT_ROOT/.agent/prd/PRD.md`
+Publish with the installed `scripts/issue-store.js create --json --root PROJECT_ROOT` command as the body of a parent issue whose title ends in `(PRD)`. On updates, retrieve the issue with `get`, replace its complete body, and publish through the SQLite CLI. Do not create or update `PROJECT_ROOT/.agent/prd/PRD.md`.
 
 ### Step 5: Iterate
 
@@ -213,8 +215,8 @@ When users provide wireframes or mockups:
 
 ## After PRD Completion
 
-Once the PRD is complete and approved, inform the user:
-"Your PRD is complete and saved. Would you like me to proceed to the next step and generate implementation tasks for developers? See [JSON.md](JSON.md)."
+Once the PRD issue is complete and approved, inform the user:
+"Your PRD is complete and saved in the project SQLite issue store. Would you like me to proceed to the next step and generate implementation tasks for developers? See [JSON.md](JSON.md)."
 
 **CRITICAL**: Make the plan extremely concise. Sacrifice grammar for the sake of concision.
 
@@ -232,4 +234,4 @@ Before saving the PRD:
 - [ ] User stories are small and specific
 - [ ] Functional requirements are numbered and unambiguous
 - [ ] Non-goals section defines clear boundaries
-- [ ] Saved to `PROJECT_ROOT/.agent/prd/PRD.md`
+- [ ] Parent `(PRD)` issue was published to `docs/issues.sqlite` with the complete body

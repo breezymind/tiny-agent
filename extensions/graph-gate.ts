@@ -88,17 +88,13 @@ const GRAPH_STATUS_TOOLS = [
 ] as const;
 
 const DOCUMENT_READ_PREFIXES = [
-  "docs/",
   "skills/",
-  "templates/",
   ".claude/",
 ] as const;
 
 const DOCUMENT_READ_NAMES = new Set([
   "AGENT.md",
   "AGENTS.md",
-  "CONTEXT.md",
-  "README.md",
   "package.json",
   "tsconfig.json",
   "settings.json",

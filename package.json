@@ -19,7 +19,6 @@
     "scripts/ai.js",
     "scripts/issue-embedding.py",
     "scripts/issue-store.js",
-    "templates",
     "README.md",
     "package.json",
     "package-lock.json"
@@ -28,7 +27,11 @@
     "ai": "./scripts/ai.js"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --import=tsx --test",
+    "build:extensions": "node scripts/build-extensions.mjs",
+    "package:smoke": "node scripts/package-smoke.mjs",
+    "worktree:check": "node scripts/worktree-check.mjs",
+    "check": "npm test && npm run build:extensions && npm run package:smoke && npm run worktree:check && git diff --check"
   },
   "pi": {
     "extensions": [
@@ -44,5 +47,9 @@
   "dependencies": {
     "@sqliteai/sqlite-vector": "^1.0.0",
     "better-sqlite3": "^12.11.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "tsx": "^4.23.1"
   }
 }

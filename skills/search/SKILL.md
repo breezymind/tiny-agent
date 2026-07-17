@@ -12,7 +12,7 @@ Use this skill when the user invokes `/search` in Pi agent chat.
 - Search only the project-local sqlite-vector issue store at `docs/issues.sqlite`.
 - Use the installed agent `scripts/issue-store.js search` CLI as the only search interface.
 - Resolve the agent directory as `${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}` and pass the target project root with `--root`.
-- Do not read `docs/tasks/*.md` as a fallback.
+- If the SQLite store is unavailable, report the CLI failure; do not use a file-based fallback.
 - Do not query SQLite directly.
 - Do not run architecture document search (`search-architecture`) from this skill.
 
