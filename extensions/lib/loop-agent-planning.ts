@@ -15,8 +15,10 @@ export const WORKFLOW_MARKER_PREFIX = "<!-- loop-agent-workflow:";
 export const PARALLEL_TASKS_START = "<!-- loop-agent-parallel-tasks:start -->";
 export const PARALLEL_TASKS_END = "<!-- loop-agent-parallel-tasks:end -->";
 
-const REQUIRED_SEMANTIC_SEARCH_LIMIT = 8;
-const SEMANTIC_RESULT_BODY_LIMIT = 2400;
+const REQUIRED_SEMANTIC_SEARCH_LIMIT = 3;
+const SEMANTIC_RESULT_BODY_LIMIT = 1200;
+
+export type GoalComplexity = "L0" | "L1" | "L2" | "L3";
 
 export type IssueStoreRecord = {
   issue_id?: unknown;
@@ -57,7 +59,8 @@ export type PlanningPromptDependencies = {
   skillPath: (skillName: string) => string;
   buildArchitectureReadGuidance: (root: string) => string;
   buildImplementSkillGuidance: (root: string) => string;
-  buildTaskTrackingInstructions: (root: string) => string;
+  buildMinimalImplementSkillGuidance?: (root: string) => string;
+  buildTaskTrackingInstructions?: (root: string) => string;
   shortenStatusLine: (text: string, maxLength?: number) => string;
 };
 
@@ -75,7 +78,10 @@ export type PlanningControllerDependencies = {
     ctx: ExtensionContext,
     explicit: boolean,
   ) => boolean;
-  findMissingPipelinePrerequisite: (root: string) => string | null;
+  findMissingPipelinePrerequisite: (
+    root: string,
+    pipelineSkillNames?: readonly string[],
+  ) => string | null;
   reserveWorkflow: (
     autoReview: boolean,
     reviewStage: ReviewStage,
@@ -108,6 +114,7 @@ export type PlanningControllerDependencies = {
     workflowId: string,
     root: string,
     semanticContext: SemanticSearchContext,
+    complexity?: GoalComplexity,
   ) => string;
 };
 
@@ -134,26 +141,42 @@ export function buildDirectCodingPrompt(
     results: [],
     architectureResults: [],
   },
+  options: { complexity?: GoalComplexity } = {},
 ): { checklist: string; prompt: string } {
+  const complexity = options.complexity ?? "L1";
+  const isMinimal = complexity === "L0";
   const checklist = buildQuickChecklist(
     objective,
     dependencies.shortenStatusLine,
   );
+  const implementationGuidance = isMinimal
+    ? (dependencies.buildMinimalImplementSkillGuidance?.(root) ??
+      dependencies.buildImplementSkillGuidance(root))
+    : dependencies.buildImplementSkillGuidance(root);
+  const taskTracking =
+    !isMinimal && dependencies.buildTaskTrackingInstructions
+      ? dependencies.buildTaskTrackingInstructions(root)
+      : "";
+  const searchContext =
+    !isMinimal &&
+    (semanticContext.results.length > 0 ||
+      semanticContext.architectureResults.length > 0)
+      ? formatSemanticSearchContext(semanticContext)
+      : "";
   const prompt = [
+    `<loop-agent-context tier="${complexity}">`,
     "작은 단일 작업이다. 인터뷰, PRD, 이슈 분해 없이 바로 구현하라.",
     "최소 변경으로 요청을 충족하고, 끝나면 변경 내용과 검증 근거를 간단히 보고하라.",
     "",
     "다음 체크리스트를 만족하도록 작업하라:",
     checklist,
     "",
-    dependencies.buildImplementSkillGuidance(root),
-    "",
-    dependencies.buildTaskTrackingInstructions(root),
-    "",
-    formatSemanticSearchContext(semanticContext),
-    "",
+    implementationGuidance,
+    ...(taskTracking ? ["", taskTracking] : []),
+    ...(searchContext ? ["", searchContext] : []),
     "작업 요청:",
     objective,
+    "</loop-agent-context>",
   ].join("\n");
 
   return { checklist, prompt };
@@ -168,34 +191,62 @@ export function buildPlanningPipelinePrompt(
     PlanningPromptDependencies,
     "skillPath" | "buildArchitectureReadGuidance"
   >,
+  complexity: GoalComplexity = "L2",
 ): string {
+  const isFocused = complexity === "L1";
+  const pipelineGuidance = isFocused
+    ? [
+        "<loop-agent-pipeline>",
+        "작업 복잡도는 L1(국소 기능)이다. 직접 연관된 코드·호출자·테스트만 확인하고 짧은 계획을 작성하라.",
+        `- ${dependencies.skillPath("grill-checklist")}`,
+        "PRD, 도메인 모델링, 이슈 분해, 의미 검색은 이 작업에 사용하지 않는다.",
+        "계획 단계에서는 코드를 수정하지 말고, 구현 범위·검증 명령·완료 조건만 정리하라.",
+        "한 번에 하나의 질문만 하며, 결과를 크게 바꾸는 미해결 사항이 있을 때만 질문하라.",
+        "</loop-agent-pipeline>",
+      ]
+    : [
+        "<loop-agent-pipeline>",
+        "아래 스킬과 SQLite issue-store 규약을 source of truth로 사용하고, 아키텍처 근거도 SQLite 검색 결과를 사용하라.",
+        `- ${dependencies.skillPath("grill-checklist")}`,
+        `- ${dependencies.skillPath("grill-with-docs")}`,
+        `- ${dependencies.skillPath("grilling")}`,
+        `- ${dependencies.skillPath("domain-modeling")}`,
+        `- ${dependencies.skillPath("to-prd")}`,
+        `- ${dependencies.skillPath("to-issues")}`,
+        dependencies.buildArchitectureReadGuidance(root),
+        "필요할 때는 `read` 도구로 설치 스킬만 읽어라. 이슈·문서·변경 이력은 위 SQLite CLI와 검색 결과를 기준으로 참고하라.",
+        `grill-checklist의 최종 목표 체크리스트에는 반드시 다음 아키텍처 준수 검증 항목을 포함하라: ${ARCHITECTURE_CHECKLIST_ITEM}`,
+        "한 번에 하나의 질문만 하고, 아직 물을 질문이 남았으면 그 턴은 질문으로 끝내라.",
+        "이전 세션의 요약이나 추측을 섞지 말고, 위 스킬·SQLite 검색 결과·현재 대화에서만 근거를 가져와라.",
+        "</loop-agent-pipeline>",
+      ];
+  const searchContext =
+    isFocused &&
+    semanticContext.results.length === 0 &&
+    semanticContext.architectureResults.length === 0
+      ? ""
+      : formatSemanticSearchContext(semanticContext);
   return [
-    "<loop-agent-pipeline>",
-    "아래 스킬과 SQLite issue-store 규약을 source of truth로 사용하고, 아키텍처 근거도 SQLite 검색 결과를 사용하라.",
-    `- ${dependencies.skillPath("grill-checklist")}`,
-    `- ${dependencies.skillPath("grill-with-docs")}`,
-    `- ${dependencies.skillPath("grilling")}`,
-    `- ${dependencies.skillPath("domain-modeling")}`,
-    `- ${dependencies.skillPath("to-prd")}`,
-    `- ${dependencies.skillPath("to-issues")}`,
-    dependencies.buildArchitectureReadGuidance(root),
-    "필요할 때는 `read` 도구로 설치 스킬만 읽어라. 이슈·문서·변경 이력은 위 SQLite CLI와 검색 결과를 기준으로 참고하라.",
-    `grill-checklist의 최종 목표 체크리스트에는 반드시 다음 아키텍처 준수 검증 항목을 포함하라: ${ARCHITECTURE_CHECKLIST_ITEM}`,
-    "한 번에 하나의 질문만 하고, 아직 물을 질문이 남았으면 그 턴은 질문으로 끝내라.",
-    "이전 세션의 요약이나 추측을 섞지 말고, 위 스킬·SQLite 검색 결과·현재 대화에서만 근거를 가져와라.",
-    "</loop-agent-pipeline>",
-    "",
-    formatSemanticSearchContext(semanticContext),
+    ...pipelineGuidance,
+    ...(searchContext ? ["", searchContext] : []),
     "",
     objective,
     "",
     "<loop-agent-auto>",
-    "이 작업은 반자동 실행 모드다. 1단계 인터뷰는 사람과 질문/답변을 주고받아 진행하고, 그 이후의 구현·검증만 확장이 자동으로 실행한다.",
+    isFocused
+      ? "이 작업은 국소 기능 계획 모드다. 불필요한 인터뷰·PRD·이슈 분해 없이 구현 계획과 검증 조건을 확정하라."
+      : "이 작업은 반자동 실행 모드다. 1단계 인터뷰는 사람과 질문/답변을 주고받아 진행하고, 그 이후의 구현·검증만 확장이 자동으로 실행한다.",
     `워크플로 ID는 ${workflowId}다. 최종 체크리스트 바로 앞에 ${WORKFLOW_MARKER_PREFIX}${workflowId} --> 주석을 정확히 출력하라.`,
-    "아직 물을 질문이 남았으면 이번 턴은 질문으로 끝내라(체크리스트를 출력하지 말라). 인터뷰가 완전히 끝난 뒤에만 구현 계획과 목표 체크리스트를 작성하라.",
+    isFocused
+      ? "결과를 크게 바꾸는 미해결 질문이 있을 때만 질문으로 끝내고, 그렇지 않으면 바로 구현 계획과 목표 체크리스트를 작성하라."
+      : "아직 물을 질문이 남았으면 이번 턴은 질문으로 끝내라(체크리스트를 출력하지 말라). 인터뷰가 완전히 끝난 뒤에만 구현 계획과 목표 체크리스트를 작성하라.",
     "체크리스트를 출력하는 마지막 턴에서는 구현 승인 여부를 다시 묻지 말라. 확장이 코드 에이전트를 자동 실행한다.",
-    `to-issues가 만든 T-### 중 병렬 코딩 후보가 있으면 ${PARALLEL_TASKS_START}와 ${PARALLEL_TASKS_END} 사이에`,
-    "서로 독립적이고 ready-for-agent이며 바로 시작 가능한 태스크 ID만 한 줄에 하나씩 출력하라. 없으면 이 블록은 생략하라.",
+    ...(isFocused
+      ? []
+      : [
+          `to-issues가 만든 T-### 중 병렬 코딩 후보가 있으면 ${PARALLEL_TASKS_START}와 ${PARALLEL_TASKS_END} 사이에`,
+          "서로 독립적이고 ready-for-agent이며 바로 시작 가능한 태스크 ID만 한 줄에 하나씩 출력하라. 없으면 이 블록은 생략하라.",
+        ]),
     "</loop-agent-auto>",
   ].join("\n");
 }
@@ -261,11 +312,19 @@ export async function runRequiredSemanticSearch(
 ): Promise<SemanticSearchContext | null> {
   if (!(await dependencies.ensureIssueStore(ctx))) return null;
 
-  const response = await dependencies.runIssueStoreCliAsync(
-    ctx.cwd,
-    ["search", objective, "--limit", String(REQUIRED_SEMANTIC_SEARCH_LIMIT)],
-    (line) => ctx.ui.notify(`loop-agent: semantic search - ${line}`, "info"),
-  );
+  // 두 검색은 issue-store 초기화 이후 서로의 결과를 참조하지 않는다.
+  // SQLite/임베딩 프로세스가 모두 끝난 뒤 결과를 판정해 검색 지연을 겹친다.
+  const [semanticSearch, architectureSearch] = await Promise.allSettled([
+    dependencies.runIssueStoreCliAsync(
+      ctx.cwd,
+      ["search", objective, "--limit", String(REQUIRED_SEMANTIC_SEARCH_LIMIT)],
+      (line) => ctx.ui.notify(`loop-agent: semantic search - ${line}`, "info"),
+    ),
+    runRequiredArchitectureSearch(ctx, objective, dependencies),
+  ]);
+
+  const response =
+    semanticSearch.status === "fulfilled" ? semanticSearch.value : undefined;
   if (response?.ok !== true) {
     ctx.ui.notify(
       "loop-agent: 필수 semantic search에 실패해 자동 파이프라인을 중단합니다. 임베딩 환경(ISSUE_EMBEDDING_COMMAND/Python)을 확인하세요.",
@@ -291,12 +350,20 @@ export async function runRequiredSemanticSearch(
     "info",
   );
 
-  const architectureResults = await runRequiredArchitectureSearch(
-    ctx,
-    objective,
-    dependencies,
-  );
-  if (!architectureResults) return null;
+  if (
+    architectureSearch.status !== "fulfilled" ||
+    !architectureSearch.value
+  ) {
+    if (architectureSearch.status === "rejected") {
+      ctx.ui.notify(
+        `loop-agent: ADR/CONTEXT semantic search 실행 중 예외가 발생했습니다: ${architectureSearch.reason instanceof Error ? architectureSearch.reason.message : String(architectureSearch.reason)}`,
+        "error",
+      );
+    }
+    return null;
+  }
+
+  const architectureResults = architectureSearch.value;
   return { query: objective, results, architectureResults };
 }
 
@@ -378,17 +445,41 @@ export async function preparePlanningPipeline(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   objective: string,
-  options: { explicit?: boolean; autoReview?: boolean },
+  options: {
+    explicit?: boolean;
+    autoReview?: boolean;
+    complexity?: GoalComplexity;
+  },
   dependencies: PlanningControllerDependencies,
   promptDependencies: Pick<
     PlanningPromptDependencies,
     "skillPath" | "buildArchitectureReadGuidance"
   >,
 ): Promise<GoalPipelinePreparation> {
-  const { explicit = true, autoReview = true } = options;
+  const {
+    explicit = true,
+    autoReview = true,
+    complexity: requestedComplexity = "L2",
+  } = options;
   if (!dependencies.ensureWorkflowWorkspace(ctx, explicit)) return null;
 
-  const missing = dependencies.findMissingPipelinePrerequisite(ctx.cwd);
+  // L0는 이 함수에 들어오기 전에 direct 경로로 빠진다. 사용자가 명시적으로
+  // plan을 요청한 L0는 최소 계획 경로로 승격해 안전하게 처리한다.
+  const complexity: GoalComplexity =
+    requestedComplexity === "L0" ? "L1" : requestedComplexity;
+  const pipelineSkillNames =
+    complexity === "L1"
+      ? ["grill-checklist"]
+      : [
+          "grill-with-docs",
+          "to-prd",
+          "to-issues",
+          "grill-checklist",
+        ];
+  const missing = dependencies.findMissingPipelinePrerequisite(
+    ctx.cwd,
+    pipelineSkillNames,
+  );
   if (missing) {
     if (explicit) {
       ctx.ui.notify(
@@ -404,10 +495,14 @@ export async function preparePlanningPipeline(
     "idle",
     null,
   );
-  const semanticContext = await dependencies.runRequiredSemanticSearch(
-    ctx,
-    objective,
-  );
+  const semanticContext =
+    complexity === "L1"
+      ? {
+          query: objective,
+          results: [],
+          architectureResults: [],
+        }
+      : await dependencies.runRequiredSemanticSearch(ctx, objective);
   if (!semanticContext) {
     dependencies.releaseWorkflowIfCurrent(pi, workflowId, "goal-search-failed");
     return { blocked: true, reason: "semantic-search-failed" };
@@ -439,6 +534,7 @@ export async function preparePlanningPipeline(
         workflowId,
         ctx.cwd,
         semanticContext,
+        complexity,
       ),
     };
   } catch (error) {

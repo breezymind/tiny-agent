@@ -5,7 +5,7 @@ import type {
   SessionCompactEvent,
   SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -29,6 +29,7 @@ import {
   preparePlanningPipeline,
   runRequiredSemanticSearch as runPlanningSemanticSearch,
   type GoalPipelinePreparation,
+  type GoalComplexity,
   type IssueStoreRecord,
   type PlanningSearchDependencies,
 } from "./lib/loop-agent-planning.ts";
@@ -71,6 +72,11 @@ import {
   withRolePersona,
   type LoopAgentRole,
 } from "./lib/loop-agent-persona.ts";
+import {
+  buildComplexityRouterPrompt,
+  COMPLEXITY_ROUTER_TIMEOUT_MS,
+  parseComplexityRouterResult,
+} from "./lib/loop-agent-complexity.ts";
 
 // loop-agent: 새 세션의 첫 메시지 또는 /hard-goal을 자동 계획 파이프라인으로 감싸
 // 하나의 턴에서 grill-with-docs → to-prd → to-issues → grill-checklist
@@ -489,10 +495,15 @@ function shouldSkipSnapshotPath(relativePath: string): boolean {
   );
 }
 
-function copyWorkspaceSnapshot(sourceRoot: string, snapshotRoot: string): void {
-  fs.mkdirSync(snapshotRoot, { recursive: true });
-  fs.cpSync(sourceRoot, snapshotRoot, {
+async function copyWorkspaceSnapshot(
+  sourceRoot: string,
+  snapshotRoot: string,
+): Promise<void> {
+  await fs.promises.cp(sourceRoot, snapshotRoot, {
     recursive: true,
+    // APFS/reflink-capable filesystems can make each task snapshot a cheap
+    // copy-on-write clone; filesystems without support transparently fall back.
+    mode: fs.constants.COPYFILE_FICLONE,
     filter: (source) => {
       const relativePath = path.relative(sourceRoot, source);
       if (!relativePath) return true;
@@ -645,107 +656,6 @@ function applySnapshotChanges(
   return { ok: true };
 }
 
-function isLikelyQuickTask(objective: string): boolean {
-  const normalized = objective.replace(/\s+/g, " ").trim().toLowerCase();
-  if (!normalized) return false;
-  if (normalized.length > 120) return false;
-  if (/\n|;|&&|\|\|/.test(normalized)) return false;
-
-  const actionMarkers = [
-    "fix",
-    "remove",
-    "rename",
-    "update",
-    "add",
-    "change",
-    "adjust",
-    "reduce",
-    "simplify",
-    "shorten",
-    "cleanup",
-    "patch",
-    "replace",
-    "restore",
-    "allow",
-    "block",
-    "sort",
-    "normalize",
-    "trim",
-    "repair",
-    "enable",
-    "disable",
-    "강화",
-    "완화",
-    "수정",
-    "추가",
-    "삭제",
-    "변경",
-    "정리",
-    "줄여",
-    "줄이",
-    "짧게",
-    "정규화",
-    "복구",
-    "차단",
-    "허용",
-    "개선",
-    "패치",
-    "교체",
-    "조정",
-    "해결",
-    "고쳐",
-    "고치",
-    "바꿔",
-    "바꾸",
-    "아껴",
-    "아끼",
-    "만들",
-    "수리",
-  ];
-  if (!actionMarkers.some((marker) => normalized.includes(marker))) {
-    return false;
-  }
-
-  const complexityMarkers = [
-    "plan",
-    "prd",
-    "design",
-    "architecture",
-    "analysis",
-    "review",
-    "test",
-    "migration",
-    "refactor",
-    "document",
-    "spec",
-    "prototype",
-    "investigate",
-    "analyze",
-    "multiple",
-    "all of",
-    "여러",
-    "복수",
-    "전체",
-    "모두",
-    "계획",
-    "설계",
-    "분석",
-    "검토",
-    "테스트",
-    "마이그레이션",
-    "리팩터",
-    "문서",
-    "사양",
-    "아키텍처",
-  ];
-  if (complexityMarkers.some((marker) => normalized.includes(marker))) {
-    return false;
-  }
-
-  const words = normalized.split(/\s+/).length;
-  return words <= 12;
-}
-
 function parseGoalMode(
   objective: string,
 ): { mode: "plan" | "direct"; objective: string } | null {
@@ -877,6 +787,16 @@ function buildImplementSkillGuidance(root: string): string {
     "이 자동 파이프라인에서는 `/tdd`, `/code-review` 슬래시 호출을 스스로 하지 말라.",
     "직접 git 커밋/푸시는 하지 말고, 태스크 상태는 위 <task-tracking> 지침만 따르라.",
     "테스트 실행은 가능하지만, 최종 판정은 별도 테스트·검수 에이전트가 다시 확인한다.",
+    "</implement-adapter>",
+  ].join("\n");
+}
+
+function buildMinimalImplementSkillGuidance(_root: string): string {
+  return [
+    "<implement-adapter>",
+    "L0 단순 변경이다. 직접 연관된 파일과 테스트만 확인하고 최소 범위로 수정하라.",
+    "불필요한 아키텍처·이슈·문서 검색을 하지 말라.",
+    "가능한 관련 테스트와 정적 검사를 실행하고, 직접 git 커밋/푸시는 하지 말라.",
     "</implement-adapter>",
   ].join("\n");
 }
@@ -1051,6 +971,55 @@ function scheduleLengthContinue(
 const state: GateState = createInitialGateState();
 
 let config = loadWorkflowConfig(CONFIG_PATH);
+
+async function classifyGoalComplexityWithPersona(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  objective: string,
+): Promise<GoalComplexity> {
+  const modelName =
+    config.planningModel ??
+    (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null);
+  const prompt = buildComplexityRouterPrompt(objective);
+  const args = [
+    "--mode",
+    "json",
+    "--print",
+    "--no-session",
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-context-files",
+    "--no-tools",
+    "--thinking",
+    "minimal",
+  ];
+  if (modelName) args.push("--model", modelName);
+  args.push(prompt);
+
+  try {
+    const result = await processRuntime.runPiCommandWithProgress(
+      pi,
+      ctx.cwd,
+      ctx.ui,
+      "작업 복잡도 판정 에이전트",
+      args,
+      COMPLEXITY_ROUTER_TIMEOUT_MS,
+      ctx.isIdle,
+    );
+    const complexity = parseComplexityRouterResult(result.finalText);
+    if (result.code === 0 && complexity) {
+      return complexity;
+    }
+    throw new Error(result.stderr.trim() || "복잡도 JSON 판정 결과가 없습니다.");
+  } catch (error) {
+    ctx.ui.notify(
+      `loop-agent: 복잡도 판정에 실패해 안전한 L2 계획 경로를 사용합니다 (${error instanceof Error ? error.message : String(error)}).`,
+      "warning",
+    );
+    return "L2";
+  }
+}
 
 export function createLoopAgentExecutionRuntime(
   dependencies: Partial<LoopAgentExecutionRuntime> = {},
@@ -1517,6 +1486,7 @@ function resolveVerificationCommands(root: string): VerificationCommandSpec[] {
               ? item.timeoutMs
               : TEST_TIMEOUT_MS,
           required: item.required !== false,
+          parallel: item.parallel !== false,
         }));
     } catch {
       return [];
@@ -1772,7 +1742,7 @@ async function runParallelCodingPhase(
         `loop-agent-${Date.now()}-${task.id}-${randomUUID()}`,
       );
       snapshotDirs.push(snapshotDir);
-      copyWorkspaceSnapshot(ctx.cwd, snapshotDir);
+      await copyWorkspaceSnapshot(ctx.cwd, snapshotDir);
       const prompt = buildParallelTaskCodingPrompt(task, checklist, snapshotDir);
       const taskCtx: ExtensionContext = { ...ctx, cwd: snapshotDir };
       const output = await runCodingAgent(pi, taskCtx, prompt, process, workflowConfig);
@@ -2555,22 +2525,33 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
   async function prepareGoalPipeline(
     ctx: ExtensionContext,
     objective: string,
-    { explicit = true, autoReview = true }: { explicit?: boolean; autoReview?: boolean } = {},
+    {
+      explicit = true,
+      autoReview = true,
+      complexity = "L2",
+    }: {
+      explicit?: boolean;
+      autoReview?: boolean;
+      complexity?: GoalComplexity;
+    } = {},
   ): Promise<GoalPipelinePreparation> {
     return preparePlanningPipeline(
       pi,
       ctx,
       objective,
-      { explicit, autoReview },
+      { explicit, autoReview, complexity },
       {
         ensureWorkflowWorkspace,
-        findMissingPipelinePrerequisite: () =>
-          findPlanningPrerequisite(skillPath, [
-            "grill-with-docs",
-            "to-prd",
-            "to-issues",
-            SKILL_NAME,
-          ]),
+        findMissingPipelinePrerequisite: (_root, pipelineSkillNames) =>
+          findPlanningPrerequisite(
+            skillPath,
+            pipelineSkillNames ?? [
+              "grill-with-docs",
+              "to-prd",
+              "to-issues",
+              SKILL_NAME,
+            ],
+          ),
         reserveWorkflow,
         runRequiredSemanticSearch: (searchCtx, searchObjective) =>
           runPlanningSemanticSearch(
@@ -2588,17 +2569,20 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
           workflowId,
           root,
           semanticContext,
-        ) =>
-          withRolePersona(
-            "planning",
-            buildPlanningPrompt(
-              promptObjective,
-              workflowId,
-              root,
-              semanticContext,
-              { skillPath, buildArchitectureReadGuidance },
-            ),
-          ),
+          complexity = "L2",
+        ) => {
+          const prompt = buildPlanningPrompt(
+            promptObjective,
+            workflowId,
+            root,
+            semanticContext,
+            { skillPath, buildArchitectureReadGuidance },
+            complexity,
+          );
+          return complexity === "L1"
+            ? prompt
+            : withRolePersona("planning", prompt);
+        },
       },
       { skillPath, buildArchitectureReadGuidance },
     );
@@ -2614,19 +2598,9 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     if (!ensureWorkflowWorkspace(ctx, explicit)) return false;
 
     const checklist = buildPlanningQuickChecklist(objective, shortenStatusLine);
-    // 직접/소규모 작업도 계획 파이프라인과 동일하게 SQLite 이슈 검색과
-    // ADR/CONTEXT 검색을 통과해야 한다. 검색 결과는 코드 에이전트 프롬프트에
-    // 직접 주입하고, 실패하면 업무를 시작하지 않는다.
+    // L0 direct 작업은 이슈·아키텍처 semantic search와 전체 계획 스킬을
+    // 사용하지 않는다. 실제 코드 에이전트가 관련 파일과 테스트만 확인한다.
     const workflowId = reserveWorkflow(autoReview, "awaiting-execution", checklist);
-    const semanticContext = await runPlanningSemanticSearch(
-      ctx,
-      objective,
-      planningSearchDependencies,
-    );
-    if (!semanticContext) {
-      releaseWorkflowIfCurrent(piApi, workflowId, "quick-goal-search-failed");
-      return false;
-    }
     if (!isCurrentWorkflow(workflowId)) return false;
 
     const { prompt } = buildPlanningDirectCodingPrompt(
@@ -2635,11 +2609,11 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       {
         skillPath,
         buildArchitectureReadGuidance,
-        buildImplementSkillGuidance,
-        buildTaskTrackingInstructions,
+        buildImplementSkillGuidance: buildMinimalImplementSkillGuidance,
         shortenStatusLine,
       },
-      semanticContext,
+      undefined,
+      { complexity: "L0" },
     );
 
     state.pendingCodingPrompt = prompt;
@@ -2672,8 +2646,12 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     ctx: ExtensionContext,
     objective: string,
     autoReview = true,
+    complexity: GoalComplexity = "L2",
   ): Promise<void> {
-    const preparation = await prepareGoalPipeline(ctx, objective, { autoReview });
+    const preparation = await prepareGoalPipeline(ctx, objective, {
+      autoReview,
+      complexity,
+    });
     if (preparation && "prompt" in preparation) {
       piApi.sendUserMessage(preparation.prompt);
     }
@@ -2683,16 +2661,37 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
   // 공유한다. 명시적 명령은 sendUserMessage로 새 턴을 시작하고, 첫 메시지
   // 입력 핸들러는 prompt 텍스트를 반환해 원문을 치환한다.
   async function resolveEasyGoalWorkflow(
+    piApi: ExtensionAPI,
     ctx: ExtensionContext,
     rawObjective: string,
     explicit: boolean,
   ): Promise<{ handled: boolean; prompt?: string }> {
     const mode = parseGoalMode(rawObjective);
     const objective = mode?.objective ?? rawObjective;
+    const complexity: GoalComplexity =
+      mode?.mode === "direct"
+        ? "L0"
+        : mode?.mode === "plan"
+          ? "L2"
+          : await classifyGoalComplexityWithPersona(piApi, ctx, objective);
+
+    // L0 요청은 인터뷰·검색·계획 모델을 거치지 않고 최소 컨텍스트의 코드
+    // 경로로 보낸다. plan 접두어는 사용자가 요청한 계획 경로를 유지한다.
+    if (complexity === "L0") {
+      const started = await startQuickWorkflow(
+        piApi,
+        ctx,
+        objective,
+        explicit,
+        false,
+      );
+      return { handled: started };
+    }
 
     const preparation = await prepareGoalPipeline(ctx, objective, {
       explicit,
       autoReview: false,
+      complexity,
     });
     if (!preparation) return { handled: false };
     if ("blocked" in preparation) {
@@ -2712,7 +2711,12 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
     rawObjective: string,
     explicit: boolean,
   ): Promise<boolean> {
-    const result = await resolveEasyGoalWorkflow(ctx, rawObjective, explicit);
+    const result = await resolveEasyGoalWorkflow(
+      piApi,
+      ctx,
+      rawObjective,
+      explicit,
+    );
     if (!result.prompt) return result.handled;
     piApi.sendUserMessage(result.prompt);
     return true;
@@ -2746,7 +2750,7 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
 
     // 첫 메시지도 /easy-goal과 같은 스타터를 공유한다. 바쁨/이미 진행 중/전제
     // 파일 누락은 원본을 통과시키지만, 필수 semantic search 실패는 삼킨다.
-    const result = await resolveEasyGoalWorkflow(ctx, text, false);
+    const result = await resolveEasyGoalWorkflow(pi, ctx, text, false);
     if (!result.handled) {
       return { action: "continue" };
     }
@@ -2953,18 +2957,19 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
 
       const mode = parseGoalMode(rawObjective);
       const objective = mode?.objective ?? rawObjective;
+      const complexity: GoalComplexity =
+        mode?.mode === "direct"
+          ? "L0"
+          : mode?.mode === "plan"
+            ? "L2"
+            : await classifyGoalComplexityWithPersona(pi, ctx, objective);
 
-      if (mode?.mode === "direct") {
+      if (complexity === "L0") {
         await startQuickWorkflow(pi, ctx, objective, true);
         return;
       }
 
-      if (!mode && isLikelyQuickTask(objective)) {
-        const started = await startQuickWorkflow(pi, ctx, objective, false);
-        if (started) return;
-      }
-
-      await startGoalWorkflow(pi, ctx, objective);
+      await startGoalWorkflow(pi, ctx, objective, true, complexity);
     },
   });
 

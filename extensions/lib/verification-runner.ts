@@ -8,6 +8,8 @@ export type VerificationCommandSpec = {
   cwd?: string;
   timeoutMs: number;
   required?: boolean;
+  /** Run concurrently by default; set false for commands sharing mutable resources. */
+  parallel?: boolean;
 };
 
 export type VerificationCommandResult = {
@@ -57,6 +59,11 @@ type ProcessOutcome = {
 };
 
 const FORCE_KILL_GRACE_MS = 100;
+const DEFAULT_PARALLEL_VERIFICATION_CONCURRENCY = 2;
+
+export type VerificationOptions = {
+  maxConcurrency?: number;
+};
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -224,13 +231,45 @@ export async function runVerificationCommand(
 
 export async function runVerification(
   specs: readonly VerificationCommandSpec[],
+  options: VerificationOptions = {},
 ): Promise<VerificationResult> {
   const startedAtMs = Date.now();
   const startedAt = new Date(startedAtMs).toISOString();
-  const results: VerificationCommandResult[] = [];
+  const results = new Array<VerificationCommandResult>(specs.length);
+  const requestedConcurrency = options.maxConcurrency ?? DEFAULT_PARALLEL_VERIFICATION_CONCURRENCY;
+  const maxConcurrency = Number.isFinite(requestedConcurrency)
+    ? Math.max(1, Math.floor(requestedConcurrency))
+    : DEFAULT_PARALLEL_VERIFICATION_CONCURRENCY;
 
-  for (const spec of specs) {
-    results.push(await runVerificationCommand(spec));
+  // Commands run concurrently by default. A command must explicitly opt out
+  // when it shares ports, caches, or databases with another verification.
+  let index = 0;
+  while (index < specs.length) {
+    if (specs[index]?.parallel === false) {
+      results[index] = await runVerificationCommand(specs[index]);
+      index += 1;
+      continue;
+    }
+
+    const groupStart = index;
+    while (index < specs.length && specs[index]?.parallel !== false) index += 1;
+    const group = specs.slice(groupStart, index);
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < group.length) {
+        const groupIndex = next;
+        next += 1;
+        results[groupStart + groupIndex] = await runVerificationCommand(
+          group[groupIndex],
+        );
+      }
+    };
+    await Promise.all(
+      Array.from(
+        { length: Math.min(maxConcurrency, group.length) },
+        () => worker(),
+      ),
+    );
   }
 
   const requiredResults = results.filter((result) => result.required);

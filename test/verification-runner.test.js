@@ -1,5 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 const {
   runVerificationCommand,
@@ -37,6 +40,43 @@ test("runs a successful command with separated arguments and captures its result
   assert.equal(aggregate.status, "PASS");
   assert.equal(aggregate.requiredCount, 1);
   assert.equal(aggregate.requiredExecutedCount, 1);
+});
+
+test("runs verification commands concurrently by default and preserves order", async () => {
+  const marker = path.join(
+    os.tmpdir(),
+    `verification-parallel-${process.pid}-${Date.now()}`,
+  );
+  const script = `
+    const fs = require("node:fs");
+    const marker = process.argv[1];
+    const label = process.argv[2];
+    let overlapped = false;
+    try {
+      fs.writeFileSync(marker, String(process.pid), { flag: "wx" });
+    } catch {
+      overlapped = true;
+    }
+    setTimeout(() => {
+      process.stdout.write(label + (overlapped ? "-overlap" : "-first"));
+      try { fs.unlinkSync(marker); } catch {}
+    }, 120);
+  `;
+
+  try {
+    const aggregate = await runVerification([
+      nodeCommand(script, marker, "first"),
+      nodeCommand(script, marker, "second"),
+    ]);
+
+    assert.equal(aggregate.status, "PASS");
+    assert.equal(aggregate.results.length, 2);
+    assert.match(aggregate.results[0].stdout, /^first-/);
+    assert.match(aggregate.results[1].stdout, /^second-/);
+    assert.ok(aggregate.results.some((result) => result.stdout.endsWith("-overlap")));
+  } finally {
+    try { fs.unlinkSync(marker); } catch {}
+  }
 });
 
 test("returns FAIL and captures stdout/stderr for exit code 1", async () => {
