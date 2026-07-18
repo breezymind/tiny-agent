@@ -61,7 +61,7 @@ test("persona path follows the Pi coding agent directory", () => {
   );
 });
 
-test("configured testModel receives the test persona while PASS stays deterministic", async () => {
+test("configured testModel receives the test persona and executes the declared verification", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "loop-agent-persona-"));
   const agentDir = path.join(root, "agent");
   const projectRoot = path.join(root, "project");
@@ -115,7 +115,36 @@ test("configured testModel receives the test persona while PASS stays determinis
       {
         runPiCommandWithProgress: async (_pi, _cwd, _ui, _label, args) => {
           capturedArgs = args;
-          return { code: 0, finalText: "test analysis", stderr: "" };
+          return {
+            code: 0,
+            finalText: [
+              "test agent executed the verification",
+              "<!-- loop-agent-test-verification:start -->",
+              JSON.stringify({
+                results: [
+                  {
+                    program: process.execPath,
+                    args: ["-e", "process.exit(0)"],
+                    cwd: projectRoot,
+                    timeoutMs: 15 * 60 * 1000,
+                    required: true,
+                    status: "PASS",
+                    spawned: true,
+                    exitCode: 0,
+                    signal: null,
+                    timeout: false,
+                    stdout: "",
+                    stderr: "",
+                    startedAt: new Date().toISOString(),
+                    endedAt: new Date().toISOString(),
+                    durationMs: 1,
+                  },
+                ],
+              }),
+              "<!-- loop-agent-test-verification:end -->",
+            ].join("\n"),
+            stderr: "",
+          };
         },
         killActiveChildren: () => 0,
       },
@@ -123,7 +152,8 @@ test("configured testModel receives the test persona while PASS stays determinis
 
     assert.equal(result.result.overall, "PASS");
     assert.match(capturedArgs.at(-1), /test persona from persona\.json/);
-    assert.match(result.report, /test analysis/);
+    assert.match(capturedArgs.join("\n"), /bash,read,grep,find,ls/);
+    assert.match(result.report, /test agent executed the verification/);
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;

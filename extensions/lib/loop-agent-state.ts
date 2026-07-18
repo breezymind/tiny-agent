@@ -36,6 +36,7 @@ export type GateState = {
   workflowId: string | null;
   processingWorkflowId: string | null;
   lengthContinueCount: number;
+  checklistFormatRetryCount: number;
 };
 
 export type WorkflowFailureItem = {
@@ -59,6 +60,7 @@ export type PersistedWorkflowState = Pick<
   | "autoMode"
   | "autoReview"
   | "workflowId"
+  | "checklistFormatRetryCount"
 >;
 
 export function createInitialGateState(): GateState {
@@ -75,6 +77,7 @@ export function createInitialGateState(): GateState {
     workflowId: null,
     processingWorkflowId: null,
     lengthContinueCount: 0,
+    checklistFormatRetryCount: 0,
   };
 }
 
@@ -99,6 +102,7 @@ export function reserveWorkflow(
   state.improvementRound = 0;
   state.workflowId = workflowId;
   state.processingWorkflowId = null;
+  state.checklistFormatRetryCount = 0;
   return workflowId;
 }
 
@@ -112,6 +116,7 @@ export function releaseWorkflow(state: GateState): void {
   state.autoReview = true;
   state.workflowId = null;
   state.processingWorkflowId = null;
+  state.checklistFormatRetryCount = 0;
 }
 
 export function resetForFreshSession(state: GateState): void {
@@ -125,6 +130,7 @@ export function resetForFreshSession(state: GateState): void {
   state.workflowId = null;
   state.processingWorkflowId = null;
   state.lengthContinueCount = 0;
+  state.checklistFormatRetryCount = 0;
 }
 
 export function markTesting(state: GateState): void {
@@ -151,6 +157,7 @@ export function completeWorkflow(state: GateState): void {
   state.autoReview = true;
   state.workflowId = null;
   state.processingWorkflowId = null;
+  state.checklistFormatRetryCount = 0;
 }
 
 export function failWorkflow(state: GateState): void {
@@ -160,6 +167,7 @@ export function failWorkflow(state: GateState): void {
   state.autoReview = true;
   state.workflowId = null;
   state.processingWorkflowId = null;
+  state.checklistFormatRetryCount = 0;
 }
 
 export function scheduleImprovement(state: GateState): number {

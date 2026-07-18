@@ -22,7 +22,12 @@ function createFakePiRuntime({ maxRounds = 2, reviewMode = "pass" } = {}) {
   fs.mkdirSync(projectRoot, { recursive: true });
   fs.writeFileSync(
     path.join(agentDir, "settings.json"),
-    JSON.stringify({ loopAgent: { maxImprovementRounds: maxRounds } }),
+    JSON.stringify({
+      loopAgent: {
+        maxImprovementRounds: maxRounds,
+        testModel: "fake/test-model",
+      },
+    }),
   );
 
   const reviewStatePath = path.join(root, "review-count");
@@ -31,17 +36,61 @@ function createFakePiRuntime({ maxRounds = 2, reviewMode = "pass" } = {}) {
     fakePiPath,
     `#!/usr/bin/env node
 const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
 const prompt = process.argv.at(-1) || "";
 const reviewStatePath = process.env.FAKE_PI_REVIEW_STATE;
 const mode = process.env.FAKE_PI_REVIEW_MODE || "pass";
 let text = "fake coding agent completed";
-if (prompt.includes("테스트 실패 원인 분석 에이전트")) {
+if (prompt.includes("실제 테스트를 실행하는 테스트 서브에이전트")) {
+  const specBlock = prompt.match(/실행할 검증 명령 목록\\(JSON\\):\\n([\\s\\S]*?)\\n\\n<!-- loop-agent-test-verification:start -->/);
+  const specs = JSON.parse(specBlock[1]);
+  const results = specs.map((spec) => {
+    const startedAt = new Date().toISOString();
+    const startedMs = Date.now();
+    const completed = spawnSync(spec.program, spec.args, {
+      cwd: spec.cwd,
+      encoding: "utf8",
+      timeout: spec.timeoutMs,
+    });
+    const timedOut = completed.error?.code === "ETIMEDOUT";
+    const spawned = completed.error?.code !== "ENOENT";
+    const status = !spawned || completed.error
+      ? "UNVERIFIED"
+      : timedOut || completed.signal || completed.status !== 0
+        ? "FAIL"
+        : "PASS";
+    return {
+      program: spec.program,
+      args: spec.args,
+      cwd: spec.cwd,
+      timeoutMs: spec.timeoutMs,
+      required: spec.required,
+      status,
+      spawned,
+      exitCode: completed.status,
+      signal: completed.signal,
+      timeout: timedOut,
+      stdout: completed.stdout || "",
+      stderr: completed.stderr || "",
+      ...(completed.error ? { error: completed.error.message } : {}),
+      startedAt,
+      endedAt: new Date().toISOString(),
+      durationMs: Date.now() - startedMs,
+    };
+  });
+  text = [
+    "fake test subagent executed the verification commands",
+    "<!-- loop-agent-test-verification:start -->",
+    JSON.stringify({ results }),
+    "<!-- loop-agent-test-verification:end -->",
+  ].join("\\n");
+} else if (prompt.includes("테스트 실패 원인 분석 에이전트")) {
   text = [
     "<!-- grill-review:start -->",
     JSON.stringify({
       overall: "FAIL",
       failedItems: [{
-        item: "결정적 검증 명령",
+        item: "테스트 서브에이전트 검증 명령",
         reason: "fixture failure requires a code change",
         evidence: "fake Pi runtime",
       }],
@@ -196,6 +245,37 @@ function messageTypes(runtime) {
   return runtime.messages.map(({ message }) => message.customType).filter(Boolean);
 }
 
+test("planning checklist boundaries are strict but unwrapped checkbox output is repairable", async () => {
+  const runtime = createFakePiRuntime();
+  try {
+    const module = await loadLoopAgent(runtime);
+    const workflowId = "6309f46f-a840-4a5d-9a0c-cd6ab30b8480";
+    const unwrapped = [
+      "<!-- loop-agent-implementation-summary:end -->",
+      `<!-- loop-agent-workflow:${workflowId} -->`,
+      "최종 목표 체크리스트",
+      "- [ ] 첫 번째 완료 조건",
+      "- [ ] 두 번째 완료 조건",
+    ].join("\n");
+
+    assert.equal(module.extractChecklist(unwrapped), null);
+    assert.match(
+      module.extractUnwrappedChecklist(unwrapped),
+      /첫 번째 완료 조건/,
+    );
+    assert.match(
+      module.extractUnwrappedChecklist(unwrapped),
+      /SQLite에서 검색한 아키텍처 문서/,
+    );
+    assert.match(
+      module.buildChecklistFormatRepairPrompt(workflowId),
+      /<!-- grill-checklist:start -->[\s\S]*<!-- grill-checklist:end -->/,
+    );
+  } finally {
+    runtime.cleanup();
+  }
+});
+
 test("architecture guidance routes every durable document to SQLite", async () => {
   const runtime = createFakePiRuntime();
   try {
@@ -206,6 +286,38 @@ test("architecture guidance routes every durable document to SQLite", async () =
     assert.match(guidance, /put-document/);
     assert.match(guidance, /PRD·이슈는 issue-store의 create\/get\/update-status/);
     assert.match(guidance, /프로젝트 Markdown 파일을 생성·수정하지 말고/);
+  } finally {
+    runtime.cleanup();
+  }
+});
+
+test("coding handoff keeps only the bounded implementation summary and selected task summaries", async () => {
+  const runtime = createFakePiRuntime();
+  try {
+    const module = await loadLoopAgent(runtime);
+    const planningResponse = [
+      "long planning preamble that must not reach the coding agent",
+      "x".repeat(5000),
+      "<!-- loop-agent-implementation-summary:start -->",
+      "- Edit the settings flow.",
+      "- Run the focused test.",
+      "<!-- loop-agent-implementation-summary:end -->",
+      "<!-- grill-checklist:start -->",
+      "- [ ] focused checklist",
+      "<!-- grill-checklist:end -->",
+    ].join("\n");
+
+    const handoff = module.buildCodingHandoffContext(
+      planningResponse,
+      "- [ ] focused checklist",
+      [{ id: "T-201", title: "Settings flow", summary: "Keep this task summary" }],
+    );
+
+    assert.match(handoff, /Edit the settings flow/);
+    assert.match(handoff, /T-201: Settings flow/);
+    assert.match(handoff, /Keep this task summary/);
+    assert.doesNotMatch(handoff, /long planning preamble/);
+    assert.doesNotMatch(handoff, /x{1000}/);
   } finally {
     runtime.cleanup();
   }

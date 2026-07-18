@@ -28,6 +28,7 @@ function issueToTask(record) {
     status: ["backlog", "current", "done"].includes(record.status) ? record.status : null,
     parentIds: typeof parent === "string" && parent ? [parent] : [],
     blockedByIds: Array.isArray(blockers) ? blockers.filter((value) => typeof value === "string") : [],
+    summary: typeof record.body === "string" ? record.body : "",
     raw: JSON.stringify(record, null, 2),
     sourcePath: "docs/issues.sqlite",
   };

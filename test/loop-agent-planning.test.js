@@ -43,7 +43,10 @@ test("planning prompt builders preserve checklist, architecture, and workflow ma
   assert.match(direct.checklist, /아키텍처/);
   assert.match(direct.prompt, /existing issue/);
   assert.match(planning, /loop-agent-workflow:workflow-1/);
+  assert.match(planning, /loop-agent-implementation-summary:start/);
   assert.match(planning, /grill-checklist/);
+  assert.match(planning, /<!-- grill-checklist:start -->/);
+  assert.match(planning, /<!-- grill-checklist:end -->/);
   assert.match(planning, /docs\/adr\/001\.md/);
 });
 

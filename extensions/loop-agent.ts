@@ -19,6 +19,8 @@ import {
 } from "./lib/loop-agent-planning.js";
 import {
   ARCHITECTURE_CHECKLIST_ITEM,
+  IMPLEMENTATION_SUMMARY_END,
+  IMPLEMENTATION_SUMMARY_START,
   PARALLEL_TASKS_END,
   PARALLEL_TASKS_START,
   WORKFLOW_MARKER_PREFIX,
@@ -54,7 +56,7 @@ import {
   type WorkflowConfig,
 } from "./lib/loop-agent-state.ts";
 import {
-  runVerification,
+  type VerificationCommandResult,
   type VerificationCommandSpec,
   type VerificationResult,
 } from "./lib/verification-runner.ts";
@@ -100,10 +102,13 @@ const SKILL_NAME = "grill-checklist";
 // 그 체크리스트를 감지해 implement→test→review 루프로 이어간다.
 const CHECKLIST_START = "<!-- grill-checklist:start -->";
 const CHECKLIST_END = "<!-- grill-checklist:end -->";
+const CHECKLIST_ITEM_PATTERN = /^\s*(?:[-*+]\s+|\d+[.)]\s+)\[[ xX]\]\s+\S+/;
 const REVIEW_START = "<!-- grill-review:start -->";
 const REVIEW_END = "<!-- grill-review:end -->";
 const TEST_RESULT_START = "<!-- loop-agent-test-result:start -->";
 const TEST_RESULT_END = "<!-- loop-agent-test-result:end -->";
+const TEST_VERIFICATION_START = "<!-- loop-agent-test-verification:start -->";
+const TEST_VERIFICATION_END = "<!-- loop-agent-test-verification:end -->";
 const REVIEW_TIMEOUT_MS = 10 * 60 * 1000;
 const TEST_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_CODING_TIMEOUT_MS = 30 * 60 * 1000;
@@ -346,8 +351,13 @@ function runIssueStoreCliAsync(
 
 export {
   buildArchitectureReadGuidance,
-  buildDeterministicTestReport,
+  buildCodingHandoffContext,
+  buildTestReport,
+  buildChecklistFormatRepairPrompt,
+  extractChecklist,
+  extractUnwrappedChecklist,
   extractReviewResult,
+  parseTestAgentVerification,
   resolveVerificationCommands,
   reserveWorkflow,
   restoreWorkflowState,
@@ -844,6 +854,7 @@ type TaskBlock = {
   status: "backlog" | "in-progress" | "done" | null;
   parentIds: string[];
   blockedByIds: string[];
+  summary: string;
   raw: string;
   sourcePath: string;
 };
@@ -868,6 +879,9 @@ type FileBackup = {
 // length 정지 자동 재개 상한. 모델이 계속 한도에 부딪혀도 이 횟수를 넘으면
 // 재개를 멈추고 사용자에게 알린다.
 const MAX_LENGTH_CONTINUES = 10;
+// 계획 모델이 최종 체크리스트의 경계를 반복해서 누락할 때 무한 재요청하지
+// 않도록 제한한다. 경계가 없는 일반 체크리스트는 먼저 안전하게 보정한다.
+const MAX_CHECKLIST_FORMAT_RETRIES = 2;
 // 잘린 응답을 이어가라고 지시하는 후속 사용자 메시지. 사용자가 수동으로 치던
 // "진행해"를 확장이 대신 보낸다.
 const LENGTH_CONTINUE_PROMPT =
@@ -878,6 +892,74 @@ const LENGTH_CONTINUE_POLL_MS = 150;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const CODING_HANDOFF_SUMMARY_LIMIT = 2400;
+const CODING_HANDOFF_TASK_SUMMARY_LIMIT = 600;
+
+function truncateHandoffText(text: string, limit: number): string {
+  const normalized = text.trim();
+  if (normalized.length <= limit) return normalized;
+  return `${normalized.slice(0, limit - 1).trimEnd()}…`;
+}
+
+function extractImplementationSummary(text: string): string | null {
+  const start = text.indexOf(IMPLEMENTATION_SUMMARY_START);
+  if (start < 0) return null;
+  const contentStart = start + IMPLEMENTATION_SUMMARY_START.length;
+  const end = text.indexOf(IMPLEMENTATION_SUMMARY_END, contentStart);
+  if (end < 0) return null;
+  const summary = text.slice(contentStart, end).trim();
+  return summary
+    ? truncateHandoffText(summary, CODING_HANDOFF_SUMMARY_LIMIT)
+    : null;
+}
+
+type CodingHandoffTask = Pick<TaskBlock, "id" | "title" | "summary">;
+
+function buildCodingHandoffContext(
+  planningResponse: string,
+  checklist: string,
+  selectedTasks: readonly CodingHandoffTask[] = [],
+): string {
+  const implementationSummary = extractImplementationSummary(planningResponse);
+  const lines = [
+    "<loop-agent-coding-handoff>",
+    "계획 모델의 전체 응답은 재전달하지 않는다. 아래 확정 정보와 현재 코드·SQLite issue-store를 기준으로 구현하라.",
+    "",
+    "확정 목표 체크리스트:",
+    checklist,
+    "",
+    implementationSummary
+      ? "코드 에이전트용 구현 요약:"
+      : "코드 에이전트용 구현 요약이 없어 체크리스트와 실제 코드에서 범위를 확인하라.",
+    ...(implementationSummary ? [implementationSummary] : []),
+  ];
+
+  if (selectedTasks.length > 0) {
+    lines.push(
+      "",
+      "선택된 병렬 태스크 요약:",
+      PARALLEL_TASKS_START,
+      ...selectedTasks.map((task) => {
+        const summary = truncateHandoffText(
+          task.summary,
+          CODING_HANDOFF_TASK_SUMMARY_LIMIT,
+        );
+        return [
+          `- ${task.id}: ${task.title}`,
+          summary ? `  태스크 본문 요약: ${summary}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n");
+      }),
+      PARALLEL_TASKS_END,
+      "선택된 태스크의 전체 원문이 필요하면 issue-store에서 해당 T-###만 조회하라.",
+    );
+  }
+
+  lines.push("</loop-agent-coding-handoff>");
+  return lines.join("\n");
 }
 
 function shortenStatusLine(text: string, maxLength = 120): string {
@@ -1062,6 +1144,7 @@ function persistWorkflowState(
     autoMode: workflowState.autoMode,
     autoReview: workflowState.autoReview,
     workflowId: workflowState.workflowId,
+    checklistFormatRetryCount: workflowState.checklistFormatRetryCount,
   };
   pi.appendEntry("loop-agent-state", { reason, snapshot });
 }
@@ -1114,6 +1197,11 @@ function restoreWorkflowState(ctx: ExtensionContext): boolean {
     state.workflowId =
       typeof snapshot.workflowId === "string" ? snapshot.workflowId : null;
     state.processingWorkflowId = null;
+    state.checklistFormatRetryCount =
+      Number.isInteger(snapshot.checklistFormatRetryCount) &&
+      Number(snapshot.checklistFormatRetryCount) >= 0
+        ? Number(snapshot.checklistFormatRetryCount)
+        : 0;
     return true;
   }
   return false;
@@ -1228,6 +1316,12 @@ function getLastAssistantStopReason(event: AgentEndEvent): string | null {
   return null;
 }
 
+function ensureArchitectureChecklist(checklist: string): string {
+  return checklist.includes(ARCHITECTURE_CHECKLIST_ITEM)
+    ? checklist
+    : `${checklist}\n${ARCHITECTURE_CHECKLIST_ITEM}`;
+}
+
 /** grill-checklist가 약속한 주석 경계 사이의 체크리스트를 원문 그대로 꺼낸다. */
 function extractChecklist(text: string): string | null {
   const start = text.indexOf(CHECKLIST_START);
@@ -1239,9 +1333,65 @@ function extractChecklist(text: string): string | null {
 
   const checklist = text.slice(contentStart, end).trim();
   if (!checklist) return null;
-  return checklist.includes(ARCHITECTURE_CHECKLIST_ITEM)
-    ? checklist
-    : `${checklist}\n${ARCHITECTURE_CHECKLIST_ITEM}`;
+  return ensureArchitectureChecklist(checklist);
+}
+
+/**
+ * 최종 계획에서 모델이 경계 주석만 누락한 경우를 안전하게 복구한다.
+ *
+ * workflow marker 뒤의 체크박스 항목만 대상으로 하므로 인터뷰 응답이나
+ * 구현 요약의 일반 bullet을 체크리스트로 잘못 승격하지 않는다. 이 보정은
+ * 사용자가 본 것처럼 제목과 - [ ] 항목은 출력했지만 HTML 경계만 빠진
+ * 응답을 자동 실행 가능한 내부 표현으로 바꾸기 위한 것이다.
+ */
+function extractUnwrappedChecklist(text: string): string | null {
+  const workflowStart = text.lastIndexOf(WORKFLOW_MARKER_PREFIX);
+  if (workflowStart < 0) return null;
+
+  const workflowEnd = text.indexOf("-->", workflowStart);
+  if (workflowEnd < 0) return null;
+
+  const lines = text.slice(workflowEnd + 3).split(/\r?\n/);
+  const headingPattern =
+    /^\s*(?:#{1,6}\s*)?(?:(?:final|target|goal|completion)\s+)?(?:goal\s+result\s+)?checklist\s*:?\s*$/i;
+  const koreanHeadingPattern =
+    /^\s*(?:#{1,6}\s*)?(?:최종\s*)?(?:목표\s*(?:결과\s*)?)?체크리스트\s*:?\s*$/;
+  const isHeading = (line: string): boolean =>
+    headingPattern.test(line) || koreanHeadingPattern.test(line);
+  const firstItem = lines.findIndex((line) =>
+    CHECKLIST_ITEM_PATTERN.test(line),
+  );
+  if (firstItem < 0) return null;
+
+  const heading = lines
+    .slice(0, firstItem)
+    .findIndex((line) => isHeading(line));
+  const start = heading >= 0 ? heading : firstItem;
+  let end = firstItem + 1;
+  while (end < lines.length) {
+    const line = lines[end];
+    if (!line.trim() || CHECKLIST_ITEM_PATTERN.test(line)) {
+      end += 1;
+      continue;
+    }
+    break;
+  }
+
+  const checklist = lines.slice(start, end).join("\n").trim();
+  return checklist ? ensureArchitectureChecklist(checklist) : null;
+}
+
+function buildChecklistFormatRepairPrompt(workflowId: string): string {
+  return [
+    "최종 계획 응답의 형식이 자동 실행 계약을 만족하지 않아 재출력해야 합니다.",
+    `현재 workflow ID는 ${workflowId}입니다. 기존 계획·구현 요약·검증 조건은 유지하되, 최종 목표 체크리스트를 아래 경계 안에 다시 출력하세요.`,
+    "다음 두 HTML 주석은 반드시 한 글자도 바꾸지 말고 포함하세요.",
+    CHECKLIST_START,
+    "## 목표 결과 체크리스트",
+    "- [ ] 검증 가능한 결과와 통과 조건",
+    CHECKLIST_END,
+    "질문을 다시 하거나 승인 여부를 묻지 말고, 수정된 최종 계획 응답만 출력하세요.",
+  ].join("\n");
 }
 
 /** 검수 에이전트의 기계 판독 JSON을 엄격히 검사해 재귀 개선 입력으로 사용한다. */
@@ -1460,9 +1610,8 @@ function verificationCommandLabel(spec: VerificationCommandSpec): string {
 }
 
 /**
- * 테스트 에이전트가 임의로 고르는 명령을 검증 계약으로 사용하지 않는다.
- * 프로젝트가 명시한 표준 테스트 명령을 하네스가 직접 실행하며, 필요하면
- * PI_VERIFICATION_COMMANDS로 program/args 배열을 명시적으로 주입할 수 있다.
+ * 테스트 서브에이전트에 넘길 표준 검증 명령을 결정한다.
+ * 필요하면 PI_VERIFICATION_COMMANDS로 program/args 배열을 명시적으로 주입할 수 있다.
  */
 function resolveVerificationCommands(root: string): VerificationCommandSpec[] {
   const configured = process.env.PI_VERIFICATION_COMMANDS;
@@ -1570,7 +1719,7 @@ function resolveVerificationCommands(root: string): VerificationCommandSpec[] {
   return [];
 }
 
-function buildDeterministicTestReport(
+function buildTestReport(
   verification: VerificationResult,
 ): { report: string; result: TestResult } {
   const failedCommands: FailedCommand[] = verification.results
@@ -1610,7 +1759,7 @@ function buildDeterministicTestReport(
         .join("\n")
     : "- 실행할 required 검증 명령이 없습니다.";
   const report = [
-    "## 결정적 검증 실행 결과",
+    "## 테스트 서브에이전트 검증 실행 결과",
     commandSummary,
     "",
     TEST_RESULT_START,
@@ -1619,6 +1768,164 @@ function buildDeterministicTestReport(
   ].join("\n");
 
   return { report, result };
+}
+
+function aggregateTestAgentVerification(
+  results: VerificationCommandResult[],
+  startedAt: string,
+  endedAt: string,
+  reason?: string,
+): VerificationResult {
+  const requiredResults = results.filter((result) => result.required);
+  const requiredExecutedCount = requiredResults.filter((result) => result.spawned).length;
+  const requiredMissingCount = requiredResults.length - requiredExecutedCount;
+  const hasFailure = results.some((result) => result.status === "FAIL");
+  const hasUnverified = results.some((result) => result.status === "UNVERIFIED");
+  const status =
+    hasFailure
+      ? "FAIL"
+      : hasUnverified || requiredResults.length === 0 || requiredMissingCount > 0
+        ? "UNVERIFIED"
+        : "PASS";
+
+  return {
+    status,
+    overall: status,
+    results,
+    requiredCount: requiredResults.length,
+    requiredExecutedCount,
+    requiredMissingCount,
+    startedAt,
+    endedAt,
+    durationMs: Math.max(0, Date.parse(endedAt) - Date.parse(startedAt)),
+    ...(reason === undefined ? {} : { reason }),
+  };
+}
+
+function buildUnavailableTestAgentVerification(
+  specs: readonly VerificationCommandSpec[],
+  reason: string,
+): VerificationResult {
+  const startedAt = new Date().toISOString();
+  const results: VerificationCommandResult[] = specs.map((spec) => ({
+    program: spec.program,
+    args: [...spec.args],
+    cwd: spec.cwd ?? process.cwd(),
+    timeoutMs: spec.timeoutMs,
+    required: spec.required === true,
+    status: "UNVERIFIED",
+    spawned: false,
+    exitCode: null,
+    signal: null,
+    timeout: false,
+    timedOut: false,
+    stdout: "",
+    stderr: "",
+    error: reason,
+    errorCode: "TEST_AGENT_UNAVAILABLE",
+    startedAt,
+    endedAt: startedAt,
+    durationMs: 0,
+  }));
+  return aggregateTestAgentVerification(results, startedAt, startedAt, reason);
+}
+
+/** 테스트 서브에이전트가 직접 실행한 명령 결과 블록을 검증한다. */
+function parseTestAgentVerification(
+  report: string,
+  specs: readonly VerificationCommandSpec[],
+  root: string,
+): VerificationResult {
+  const start = report.indexOf(TEST_VERIFICATION_START);
+  const end = report.indexOf(TEST_VERIFICATION_END, start + TEST_VERIFICATION_START.length);
+  if (start < 0 || end < 0) {
+    throw new Error("테스트 에이전트 보고서에 실행 결과 블록이 없습니다.");
+  }
+
+  const parsed = JSON.parse(
+    report.slice(start + TEST_VERIFICATION_START.length, end).trim(),
+  ) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("테스트 에이전트 실행 결과가 객체가 아닙니다.");
+  }
+
+  const parsedResults = (parsed as { results?: unknown }).results;
+  if (!Array.isArray(parsedResults) || parsedResults.length !== specs.length) {
+    throw new Error("테스트 에이전트가 모든 검증 명령의 결과를 반환하지 않았습니다.");
+  }
+
+  const now = new Date().toISOString();
+  const results: VerificationCommandResult[] = specs.map((spec, index) => {
+    const item = parsedResults[index];
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`검증 명령 ${index + 1}의 결과 형식이 올바르지 않습니다.`);
+    }
+    const value = item as Record<string, unknown>;
+    const expectedCwd = spec.cwd ?? root;
+    const expectedArgs = [...spec.args];
+    if (
+      value.program !== spec.program ||
+      JSON.stringify(value.args) !== JSON.stringify(expectedArgs) ||
+      value.cwd !== expectedCwd ||
+      value.timeoutMs !== spec.timeoutMs ||
+      value.required !== (spec.required === true)
+    ) {
+      throw new Error(`검증 명령 ${index + 1}이 사전 정의된 명령과 다릅니다.`);
+    }
+
+    const status = value.status;
+    if (status !== "PASS" && status !== "FAIL" && status !== "UNVERIFIED") {
+      throw new Error(`검증 명령 ${index + 1}의 상태가 올바르지 않습니다.`);
+    }
+    if (typeof value.spawned !== "boolean") {
+      throw new Error(`검증 명령 ${index + 1}의 spawned 값이 없습니다.`);
+    }
+    if (value.exitCode !== null && typeof value.exitCode !== "number") {
+      throw new Error(`검증 명령 ${index + 1}의 exitCode가 올바르지 않습니다.`);
+    }
+    if (value.signal !== null && typeof value.signal !== "string") {
+      throw new Error(`검증 명령 ${index + 1}의 signal이 올바르지 않습니다.`);
+    }
+    if (typeof value.timeout !== "boolean") {
+      throw new Error(`검증 명령 ${index + 1}의 timeout 값이 없습니다.`);
+    }
+
+    const derivedStatus: VerificationResult["status"] =
+      !value.spawned || typeof value.error === "string"
+        ? "UNVERIFIED"
+        : value.timeout || value.signal !== null || value.exitCode !== 0
+          ? "FAIL"
+          : "PASS";
+    if (status !== derivedStatus) {
+      throw new Error(`검증 명령 ${index + 1}의 상태와 종료 정보가 일치하지 않습니다.`);
+    }
+
+    return {
+      program: spec.program,
+      args: expectedArgs,
+      cwd: expectedCwd,
+      timeoutMs: spec.timeoutMs,
+      required: spec.required === true,
+      status,
+      spawned: value.spawned,
+      exitCode: value.exitCode,
+      signal: value.signal,
+      timeout: value.timeout,
+      timedOut: value.timeout,
+      stdout: typeof value.stdout === "string" ? value.stdout.slice(0, 4000) : "",
+      stderr: typeof value.stderr === "string" ? value.stderr.slice(0, 4000) : "",
+      ...(typeof value.error === "string" ? { error: value.error.slice(0, 1000) } : {}),
+      ...(typeof value.errorCode === "string" ? { errorCode: value.errorCode } : {}),
+      startedAt: typeof value.startedAt === "string" ? value.startedAt : now,
+      endedAt: typeof value.endedAt === "string" ? value.endedAt : now,
+      durationMs:
+        typeof value.durationMs === "number" && Number.isFinite(value.durationMs)
+          ? Math.max(0, value.durationMs)
+          : 0,
+    };
+  });
+
+  return aggregateTestAgentVerification(results, now, now);
 }
 
 async function runValidatedTestAgent(
@@ -1632,8 +1939,7 @@ async function runValidatedTestAgent(
   result: TestResult;
   verification: VerificationResult;
 }> {
-  const verification = await runVerification(resolveVerificationCommands(ctx.cwd));
-  const deterministic = buildDeterministicTestReport(verification);
+  const verificationSpecs = resolveVerificationCommands(ctx.cwd);
   const testModel = workflowConfig.testModel ?? workflowConfig.codingModel;
   const testThinkingLevel =
     workflowConfig.testThinkingLevel ?? workflowConfig.codingThinkingLevel;
@@ -1644,23 +1950,33 @@ async function runValidatedTestAgent(
     typeof ctx.ui.notify !== "function" ||
     typeof ctx.ui.setStatus !== "function"
   ) {
-    return { ...deterministic, verification };
+    const verification = buildUnavailableTestAgentVerification(
+      verificationSpecs,
+      "테스트 서브에이전트를 실행할 모델 또는 UI가 없습니다.",
+    );
+    const testReport = buildTestReport(verification);
+    return { ...testReport, verification };
   }
 
   const testAgentPrompt = withRolePersona(
     "test",
     [
-      "당신은 테스트 역할 에이전트다.",
-      "결정적 검증 러너가 실제 명령을 이미 실행했으며 PASS/FAIL 판정의 source of truth다.",
-      "코드나 파일을 수정하지 말고, 검증 결과와 목표 체크리스트를 대조해 테스트 관점의 설명과 남은 공백만 보고하라.",
-      "검증 러너의 PASS/FAIL 판정을 변경하거나 추측으로 보완하지 말라.",
+      "당신은 실제 테스트를 실행하는 테스트 서브에이전트다.",
+      "아래 검증 명령을 현재 작업 디렉터리에서 직접 실행하라. 명령마다 bash 도구를 사용하고, program과 args를 임의로 바꾸거나 생략하지 말라.",
+      "각 검증 명령은 한 번만 실행하라. 코드나 파일은 수정하지 말라.",
+      "명령 실행 결과의 종료 코드와 stdout/stderr를 근거로 PASS, FAIL, UNVERIFIED를 판정하라.",
+      "마지막에는 반드시 지정된 구조화 결과 블록을 출력하라. 블록 안에는 설명이나 Markdown 펜스를 넣지 말라.",
       "보고서는 한국어로 작성하라.",
       "",
       "목표 결과 체크리스트:",
       checklist,
       "",
-      "결정적 검증 결과:",
-      deterministic.report,
+      "실행할 검증 명령 목록(JSON):",
+      JSON.stringify(verificationSpecs, null, 2),
+      "",
+      TEST_VERIFICATION_START,
+      '{"results":[{"program":"<실제 program>","args":["<실제 args>"],"cwd":"<실제 cwd>","timeoutMs":<실제 timeoutMs>,"required":true,"status":"PASS|FAIL|UNVERIFIED","spawned":true,"exitCode":0,"signal":null,"timeout":false,"stdout":"","stderr":"","startedAt":"<ISO-8601>","endedAt":"<ISO-8601>","durationMs":0}]}',
+      TEST_VERIFICATION_END,
     ].join("\n"),
   );
   const args = [
@@ -1673,7 +1989,7 @@ async function runValidatedTestAgent(
     "--no-prompt-templates",
     "--no-context-files",
     "--tools",
-    "read,grep,find,ls",
+    "bash,read,grep,find,ls",
     "--model",
     testModel,
   ];
@@ -1694,24 +2010,35 @@ async function runValidatedTestAgent(
       throw new Error(result.stderr.trim() || `exit code ${result.code}`);
     }
 
+    const verification = parseTestAgentVerification(
+      result.finalText,
+      verificationSpecs,
+      ctx.cwd,
+    );
+    const testReport = buildTestReport(verification);
+
     return {
       report: [
-        deterministic.report,
+        testReport.report,
         "",
-        "## 테스트 역할 에이전트 보고",
+        "## 테스트 서브에이전트 실행 보고",
         result.finalText.trim(),
       ].join("\n"),
-      result: deterministic.result,
+      result: testReport.result,
       verification,
     };
   } catch (error) {
-    // 테스트 PASS/FAIL은 결정적 검증 결과를 유지한다. 보조 테스트 에이전트
-    // 실패가 전체 워크플로를 잘못 실패시키지 않도록 결정적 보고서로 계속한다.
+    const reason = error instanceof Error ? error.message : String(error);
+    const verification = buildUnavailableTestAgentVerification(
+      verificationSpecs,
+      `테스트 서브에이전트가 검증 결과를 반환하지 못했습니다: ${reason}`,
+    );
+    const testReport = buildTestReport(verification);
     ctx.ui.notify(
-      `loop-agent: 테스트 역할 에이전트를 사용할 수 없어 결정적 검증 결과만 사용합니다 (${error instanceof Error ? error.message : String(error)}).`,
+      `loop-agent: 테스트 서브에이전트가 검증 결과를 반환하지 못했습니다 (${reason}).`,
       "warning",
     );
-    return { ...deterministic, verification };
+    return { ...testReport, verification };
   }
 }
 
@@ -2107,8 +2434,8 @@ async function runTestingStage(
   persistWorkflowState(pi, "testing-started", workflowState);
   ctx.ui.notify(
     workflowState.autoReview
-      ? "loop-agent: 결정적 검증 명령을 실행합니다. 통과하면 독립 검수를 시작합니다."
-      : "loop-agent: 결정적 검증 명령을 실행합니다.",
+      ? "loop-agent: 테스트 서브에이전트가 검증 명령을 실행합니다. 통과하면 독립 검수를 시작합니다."
+      : "loop-agent: 테스트 서브에이전트가 검증 명령을 실행합니다.",
     "info",
   );
 
@@ -2134,7 +2461,7 @@ async function runTestingStage(
     pi.sendMessage(
       {
         customType: "loop-agent-test-result",
-        content: `## 결정적 검증 실행 결과\n\n${testReport}`,
+      content: `## 테스트 서브에이전트 검증 실행 결과\n\n${testReport}`,
         display: true,
         details: {
           workflowId,
@@ -2153,7 +2480,7 @@ async function runTestingStage(
       overall: "FAIL",
       failedCommands: [
         {
-          command: "결정적 검증 실행기",
+          command: "테스트 서브에이전트 검증 실행기",
           reason: message,
           evidence:
             "검증 실행기가 성공적으로 완료되거나 구조화된 결과를 반환하지 못했습니다.",
@@ -2791,7 +3118,11 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
 
     const planningResponse = getLastAssistantText(event);
     const responseWorkflowId = extractWorkflowId(planningResponse);
-    const latestChecklist = extractChecklist(planningResponse);
+    const strictChecklist = extractChecklist(planningResponse);
+    const repairedChecklist = strictChecklist
+      ? null
+      : extractUnwrappedChecklist(planningResponse);
+    const latestChecklist = strictChecklist ?? repairedChecklist;
     let currentWorkflowId = state.workflowId;
     let recoveredFromStaleWorkflow = false;
 
@@ -2861,6 +3192,19 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (repairedChecklist) {
+        pi.appendEntry("loop-agent-checklist-repaired", {
+          workflowId: responseWorkflowId,
+          reason: "missing-boundary",
+          checklist: repairedChecklist,
+        });
+        ctx.ui.notify(
+          "loop-agent: 계획 모델이 체크리스트 경계를 누락했지만, 최종 체크박스 항목을 안전하게 보정해 실행을 계속합니다.",
+          "warning",
+        );
+      }
+      state.checklistFormatRetryCount = 0;
+
       // 이 agent_end는 명세, 구현 계획, 체크리스트를 만든 그릴링 종료 턴이다.
       // 자동 모드는 즉시 별도 코드 프로세스를 실행하고 일반 모드는 승인을 기다린다.
       state.checklist = latestChecklist;
@@ -2872,6 +3216,11 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
         workflowId,
         checklist: latestChecklist,
       });
+      const selectedCodingTasks = state.autoMode
+        ? chooseParallelCodingTasks(ctx.cwd, planningResponse, (line) => {
+            ctx.ui.notify(`loop-agent: ${line}`, "info");
+          })
+        : [];
       const codingPrompt = state.autoMode
         ? [
             "자동 실행 모드입니다. 아래 확정 명세와 구현 계획을 즉시 실행하세요.",
@@ -2882,12 +3231,11 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
             "",
             buildTaskTrackingInstructions(ctx.cwd),
             "",
-            responseWorkflowId && currentWorkflowId !== responseWorkflowId
-              ? planningResponse.replace(
-                  WORKFLOW_MARKER_PREFIX + responseWorkflowId + " -->",
-                  WORKFLOW_MARKER_PREFIX + currentWorkflowId + " -->",
-                )
-              : planningResponse,
+            buildCodingHandoffContext(
+              planningResponse,
+              latestChecklist,
+              selectedCodingTasks,
+            ),
           ].join("\n")
         : null;
       state.pendingCodingPrompt = codingPrompt;
@@ -2927,8 +3275,21 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       return;
     }
 
-      if (state.autoMode) {
-        failWorkflow(state);
+    if (state.autoMode && responseWorkflowId) {
+      if (state.checklistFormatRetryCount < MAX_CHECKLIST_FORMAT_RETRIES) {
+        state.checklistFormatRetryCount += 1;
+        persistWorkflowState(pi, "checklist-format-retry");
+        ctx.ui.notify(
+          `loop-agent: 최종 계획의 체크리스트 경계가 없어 형식을 자동으로 재요청합니다 (${state.checklistFormatRetryCount}/${MAX_CHECKLIST_FORMAT_RETRIES}).`,
+          "warning",
+        );
+        pi.sendUserMessage(
+          buildChecklistFormatRepairPrompt(responseWorkflowId),
+        );
+        return;
+      }
+
+      failWorkflow(state);
       persistWorkflowState(pi, "checklist-marker-missing");
       ctx.ui.notify(
         "loop-agent: 구현계획 응답에서 grill-checklist 경계를 찾지 못해 자동 실행을 중단했습니다. 계획 모델이 지정된 체크리스트 경계를 출력했는지 확인하세요.",

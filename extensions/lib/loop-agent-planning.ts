@@ -14,6 +14,10 @@ export const ARCHITECTURE_CHECKLIST_ITEM =
 export const WORKFLOW_MARKER_PREFIX = "<!-- loop-agent-workflow:";
 export const PARALLEL_TASKS_START = "<!-- loop-agent-parallel-tasks:start -->";
 export const PARALLEL_TASKS_END = "<!-- loop-agent-parallel-tasks:end -->";
+export const IMPLEMENTATION_SUMMARY_START =
+  "<!-- loop-agent-implementation-summary:start -->";
+export const IMPLEMENTATION_SUMMARY_END =
+  "<!-- loop-agent-implementation-summary:end -->";
 
 const REQUIRED_SEMANTIC_SEARCH_LIMIT = 3;
 const SEMANTIC_RESULT_BODY_LIMIT = 1200;
@@ -237,6 +241,12 @@ export function buildPlanningPipelinePrompt(
       ? "이 작업은 국소 기능 계획 모드다. 불필요한 인터뷰·PRD·이슈 분해 없이 구현 계획과 검증 조건을 확정하라."
       : "이 작업은 반자동 실행 모드다. 1단계 인터뷰는 사람과 질문/답변을 주고받아 진행하고, 그 이후의 구현·검증만 확장이 자동으로 실행한다.",
     `워크플로 ID는 ${workflowId}다. 최종 체크리스트 바로 앞에 ${WORKFLOW_MARKER_PREFIX}${workflowId} --> 주석을 정확히 출력하라.`,
+    `최종 계획에는 ${IMPLEMENTATION_SUMMARY_START}와 ${IMPLEMENTATION_SUMMARY_END} 사이에 코드 에이전트가 바로 사용할 구현 요약을 최대 6개 bullet, 2400자 이내로 작성하라. 변경 대상·핵심 동작·검증 명령·주의할 책임 경계만 적고, 위 문서·이슈 본문을 복사하지 말라.`,
+    "최종 목표 체크리스트는 반드시 아래 형식을 그대로 사용하라. 두 HTML 주석 경계는 선택 사항이 아니며, 이름·콜론·하이픈을 바꾸거나 생략하지 말라. 체크리스트 내용을 채운 뒤에도 두 경계를 최종 응답에 남겨라.",
+    "<!-- grill-checklist:start -->",
+    "## 목표 결과 체크리스트",
+    "- [ ] 검증 가능한 결과와 통과 조건",
+    "<!-- grill-checklist:end -->",
     isFocused
       ? "결과를 크게 바꾸는 미해결 질문이 있을 때만 질문으로 끝내고, 그렇지 않으면 바로 구현 계획과 목표 체크리스트를 작성하라."
       : "아직 물을 질문이 남았으면 이번 턴은 질문으로 끝내라(체크리스트를 출력하지 말라). 인터뷰가 완전히 끝난 뒤에만 구현 계획과 목표 체크리스트를 작성하라.",

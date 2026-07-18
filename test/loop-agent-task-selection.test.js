@@ -22,5 +22,6 @@ test("parallel candidates come from SQLite-shaped records and honor ready/blocke
 
   const selected = chooseParallelCodingTasksFromIssues(records, planningResponse);
   assert.deepEqual(selected.map((task) => task.id), ["T-201", "T-202"]);
+  assert.deepEqual(selected.map((task) => task.summary), ["A", "B"]);
   assert.ok(selected.every((task) => task.sourcePath === "docs/issues.sqlite"));
 });
