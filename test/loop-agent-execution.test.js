@@ -276,6 +276,64 @@ test("planning checklist boundaries are strict but unwrapped checkbox output is 
   }
 });
 
+test("grilling gate requires an interview turn, a user response, and one completion marker", async () => {
+  const runtime = createFakePiRuntime();
+  try {
+    const module = await loadLoopAgent(runtime);
+    const baseState = {
+      grillingRequired: true,
+      grillingQuestionCount: 1,
+      grillingUserResponseCount: 1,
+    };
+    const marker = "<!-- loop-agent-grilling:complete -->";
+
+    assert.equal(module.hasGrillingCompletionEvidence(baseState, "final plan"), false);
+    assert.equal(
+      module.hasGrillingCompletionEvidence(baseState, `final plan\n${marker}`),
+      true,
+    );
+    assert.equal(
+      module.hasGrillingCompletionEvidence(baseState, `final plan\n${marker}\n${marker}`),
+      false,
+    );
+    assert.equal(
+      module.hasGrillingCompletionEvidence(
+        { ...baseState, grillingQuestionCount: 0 },
+        `final plan\n${marker}`,
+      ),
+      false,
+    );
+    assert.equal(
+      module.hasGrillingCompletionEvidence(
+        { ...baseState, grillingRequired: false },
+        "L0 direct plan",
+      ),
+      true,
+    );
+  } finally {
+    runtime.cleanup();
+  }
+});
+
+test("grilling recovery carries the next user input without injecting a concurrent turn", async () => {
+  const runtime = createFakePiRuntime();
+  try {
+    const module = await loadLoopAgent(runtime);
+    const prompt = module.buildGrillingResumePrompt(
+      "workflow-grilling",
+      "계속 진행해",
+    );
+
+    assert.match(prompt, /workflow-grilling/);
+    assert.match(prompt, /계속 진행해/);
+    assert.match(prompt, /그 응답에서는 체크리스트 경계를 출력하지 마세요/);
+    assert.match(prompt, /loop-agent-grilling:complete/);
+    assert.equal(runtime.messages.length, 0);
+  } finally {
+    runtime.cleanup();
+  }
+});
+
 test("architecture guidance routes every durable document to SQLite", async () => {
   const runtime = createFakePiRuntime();
   try {
@@ -355,6 +413,8 @@ test("snapshot filtering excludes common credential files", async () => {
     assert.equal(module.shouldSkipSnapshotPath(".env.local"), true);
     assert.equal(module.shouldSkipSnapshotPath(".mcp.json"), true);
     assert.equal(module.shouldSkipSnapshotPath("certs/client.pem"), true);
+    assert.equal(module.shouldSkipSnapshotPath("ios/Pods/Manifest.lock"), true);
+    assert.equal(module.shouldSkipSnapshotPath("android/.gradle/cache.bin"), true);
     assert.equal(module.shouldSkipSnapshotPath("src/auth.ts"), false);
   } finally {
     runtime.cleanup();

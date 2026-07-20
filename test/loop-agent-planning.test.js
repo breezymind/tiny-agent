@@ -45,8 +45,10 @@ test("planning prompt builders preserve checklist, architecture, and workflow ma
   assert.match(planning, /loop-agent-workflow:workflow-1/);
   assert.match(planning, /loop-agent-implementation-summary:start/);
   assert.match(planning, /grill-checklist/);
+  assert.match(planning, /loop-agent-grilling:complete/);
   assert.match(planning, /<!-- grill-checklist:start -->/);
   assert.match(planning, /<!-- grill-checklist:end -->/);
+  assert.match(planning, /프로젝트 전체 `npm test`의 실행 또는 통과 여부 자체/);
   assert.match(planning, /docs\/adr\/001\.md/);
 });
 
@@ -88,6 +90,9 @@ test("L1 planning prompts use focused context without full pipeline skills", () 
     "L1",
   );
 
+  assert.match(prompt, /grilling/);
+  assert.match(prompt, /grilling을 생략하지 말라/);
+  assert.match(prompt, /loop-agent-grilling:complete/);
   assert.match(prompt, /grill-checklist/);
   assert.doesNotMatch(prompt, /to-prd/);
   assert.doesNotMatch(prompt, /to-issues/);
@@ -119,6 +124,7 @@ test("planning prerequisite lookup and controller orchestration are dependency-i
     ui: { notify: (message) => calls.push(`notify:${message}`) },
   };
   const pi = {};
+  let reservedAutoReview;
   const result = await preparePlanningPipeline(
     pi,
     ctx,
@@ -127,7 +133,8 @@ test("planning prerequisite lookup and controller orchestration are dependency-i
     {
       ensureWorkflowWorkspace: () => true,
       findMissingPipelinePrerequisite: () => null,
-      reserveWorkflow: () => {
+      reserveWorkflow: (autoReview) => {
+        reservedAutoReview = autoReview;
         calls.push("reserve");
         return "workflow-1";
       },
@@ -149,6 +156,7 @@ test("planning prerequisite lookup and controller orchestration are dependency-i
   );
 
   assert.deepEqual(result, { prompt: "planning prompt" });
+  assert.equal(reservedAutoReview, true);
   assert.deepEqual(calls, [
     "reserve",
     "search",
@@ -223,6 +231,7 @@ test("semantic search failure reports a block without consuming the source reque
 
 test("L1 planning skips semantic search and only checks focused prerequisites", async () => {
   const calls = [];
+  let reservedAutoReview;
   const result = await preparePlanningPipeline(
     {},
     { cwd: "/project", ui: { notify: (message) => calls.push(`notify:${message}`) } },
@@ -234,7 +243,10 @@ test("L1 planning skips semantic search and only checks focused prerequisites", 
         calls.push(`prerequisites:${names.join(",")}`);
         return null;
       },
-      reserveWorkflow: () => "workflow-focused",
+      reserveWorkflow: (autoReview) => {
+        reservedAutoReview = autoReview;
+        return "workflow-focused";
+      },
       runRequiredSemanticSearch: async () => {
         calls.push("search");
         throw new Error("L1 must not search");
@@ -253,7 +265,8 @@ test("L1 planning skips semantic search and only checks focused prerequisites", 
   );
 
   assert.deepEqual(result, { prompt: "focused planning prompt" });
-  assert.ok(calls.includes("prerequisites:grill-checklist"));
+  assert.ok(calls.includes("prerequisites:grilling,grill-checklist"));
   assert.ok(calls.includes("complexity:L1"));
   assert.ok(!calls.includes("search"));
+  assert.equal(reservedAutoReview, false);
 });

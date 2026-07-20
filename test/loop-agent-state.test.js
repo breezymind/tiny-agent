@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 
 const {
   createInitialGateState,
+  markGrilling,
   reserveWorkflow,
   markTesting,
   markReviewing,
@@ -53,4 +54,18 @@ test("failure transition clears execution ownership without touching the checkli
   assert.equal(state.processingWorkflowId, null);
   assert.equal(state.autoReview, true);
   assert.equal(state.lastFailure?.items[0].item, "test");
+});
+
+test("grilling recovery remains an explicit resumable phase", () => {
+  const state = createInitialGateState();
+  const workflowId = reserveWorkflow(state, false, "grilling", null);
+  state.grillingRequired = true;
+  state.grillingRepairPending = true;
+
+  markGrilling(state);
+
+  assert.equal(state.reviewStage, "grilling");
+  assert.equal(state.workflowId, workflowId);
+  assert.equal(state.checklist, null);
+  assert.equal(state.grillingRepairPending, true);
 });

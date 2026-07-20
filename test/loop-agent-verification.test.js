@@ -14,6 +14,78 @@ async function loadLoopAgent() {
   return loopAgentPromise;
 }
 
+test("stale checklist recovery requires one grilling completion marker", async () => {
+  const module = await loadLoopAgent();
+  const checklist = "## 목표 결과 체크리스트\n- [ ] 기능 결과가 맞다.";
+
+  assert.equal(
+    module.shouldAdoptRecoveredChecklist(checklist, "질문 응답만 있음"),
+    false,
+  );
+  assert.equal(
+    module.shouldAdoptRecoveredChecklist(
+      checklist,
+      "최종 계획 <!-- loop-agent-grilling:complete -->",
+    ),
+    true,
+  );
+  assert.equal(
+    module.shouldAdoptRecoveredChecklist(
+      checklist,
+      "<!-- loop-agent-grilling:complete --> <!-- loop-agent-grilling:complete -->",
+    ),
+    false,
+  );
+});
+
+test("queued loop-agent messages declare follow-up behavior", async () => {
+  const module = await loadLoopAgent();
+  const calls = [];
+  const queued = module.sendQueuedUserMessage(
+    {
+      sendUserMessage: (...args) => calls.push(args),
+    },
+    { ui: { notify: () => {} } },
+    "continue planning",
+  );
+
+  assert.equal(queued, true);
+  assert.deepEqual(calls, [
+    ["continue planning", { streamingBehavior: "followUp" }],
+  ]);
+});
+
+test("checklist extraction excludes npm test checkbox items", async () => {
+  const module = await loadLoopAgent();
+  const checklist = module.extractChecklist(
+    [
+      "<!-- grill-checklist:start -->",
+      "## 목표 결과 체크리스트",
+      "- [ ] npm test가 통과해야 한다.",
+      "- [ ] 기능 결과가 요구사항과 일치한다.",
+      "<!-- grill-checklist:end -->",
+    ].join("\n"),
+  );
+
+  assert.match(checklist, /기능 결과가 요구사항과 일치한다/);
+  assert.doesNotMatch(checklist, /npm\s+test/i);
+});
+
+test("unwrapped checklist repair excludes npm test checkbox items", async () => {
+  const module = await loadLoopAgent();
+  const checklist = module.extractUnwrappedChecklist(
+    [
+      "<!-- loop-agent-workflow:workflow-1 -->",
+      "## 목표 결과 체크리스트",
+      "- [ ] `npm test`가 PASS여야 한다.",
+      "- [ ] 화면 동작이 명세와 일치한다.",
+    ].join("\n"),
+  );
+
+  assert.match(checklist, /화면 동작이 명세와 일치한다/);
+  assert.doesNotMatch(checklist, /npm\s+test/i);
+});
+
 function createProject(testScript) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "loop-agent-verification-"));
   fs.writeFileSync(path.join(root, "verification-script.js"), testScript);

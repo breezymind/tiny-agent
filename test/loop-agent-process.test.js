@@ -37,6 +37,7 @@ test("event parser tracks tools and final assistant text without the workflow mo
 test("injected Pi process runtime parses NDJSON and reports progress", async () => {
   const messages = [];
   const statuses = [];
+  const widgets = [];
   const runtime = createPiProcessRuntime({
     registerExitHandler: false,
     spawnProcess(_program, args) {
@@ -58,16 +59,89 @@ test("injected Pi process runtime parses NDJSON and reports progress", async () 
   const result = await runtime.runPiCommandWithProgress(
     { sendMessage: (message) => messages.push(message) },
     process.cwd(),
-    { setStatus: (_label, message) => statuses.push(message) },
+    {
+      setStatus: (_label, message) => statuses.push(message),
+      setWidget: (key, content, options) => widgets.push({ key, content, options }),
+    },
     "fake Pi",
     ["--mode", "json", "prompt"],
   );
 
   assert.equal(result.code, 0);
   assert.equal(result.finalText, "completed");
-  assert.ok(messages.some((message) => message.customType === "loop-agent-progress"));
+  assert.equal(messages.length, 0);
+  assert.ok(widgets.length >= 2);
+  assert.ok(widgets.every((widget) => widget.key === "loop-agent-progress"));
+  assert.ok(widgets.some((widget) => widget.content?.some((line) => line.includes("read: x"))));
+  assert.deepEqual(widgets.at(-1), {
+    key: "loop-agent-progress",
+    content: undefined,
+    options: { placement: "aboveEditor" },
+  });
   assert.equal(statuses.at(-1), undefined);
   assert.equal(runtime.killActiveChildren(), 0);
+});
+
+test("parallel Pi children share one replaceable progress widget", async () => {
+  const children = [];
+  const widgets = [];
+  const runtime = createPiProcessRuntime({
+    registerExitHandler: false,
+    spawnProcess() {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = () => true;
+      children.push(child);
+      return child;
+    },
+  });
+  const ui = {
+    setStatus: () => {},
+    setWidget: (key, content, options) => widgets.push({ key, content, options }),
+  };
+
+  const first = runtime.runPiCommandWithProgress(
+    { sendMessage: () => {} },
+    process.cwd(),
+    ui,
+    "첫 번째 에이전트",
+    ["prompt"],
+  );
+  const second = runtime.runPiCommandWithProgress(
+    { sendMessage: () => {} },
+    process.cwd(),
+    ui,
+    "두 번째 에이전트",
+    ["prompt"],
+  );
+
+  assert.equal(children.length, 2);
+  assert.ok(
+    widgets.some(
+      (widget) =>
+        widget.content?.some((line) => line.includes("첫 번째 에이전트")) &&
+        widget.content?.some((line) => line.includes("두 번째 에이전트")),
+    ),
+  );
+
+  for (const [child, text] of children.map((child, index) => [child, `완료 ${index + 1}`])) {
+    child.stdout.write(
+      `${JSON.stringify({
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [{ type: "text", text }] }],
+      })}\n`,
+    );
+    child.stdout.end();
+    child.emit("close", 0, null);
+  }
+
+  await Promise.all([first, second]);
+  assert.deepEqual(widgets.at(-1), {
+    key: "loop-agent-progress",
+    content: undefined,
+    options: { placement: "aboveEditor" },
+  });
 });
 
 test("Pi process runtime terminates a timed-out child", async () => {
@@ -91,7 +165,7 @@ test("Pi process runtime terminates a timed-out child", async () => {
     runtime.runPiCommandWithProgress(
       { sendMessage: () => {} },
       process.cwd(),
-      { setStatus: () => {} },
+      { setStatus: () => {}, setWidget: () => {} },
       "timed-out Pi",
       ["prompt"],
       10,

@@ -12,6 +12,7 @@ import type {
 export const ARCHITECTURE_CHECKLIST_ITEM =
   "- [ ] SQLite에서 검색한 아키텍처 문서의 책임 경계·source of truth·불변조건을 지킨다.";
 export const WORKFLOW_MARKER_PREFIX = "<!-- loop-agent-workflow:";
+export const GRILLING_COMPLETE_MARKER = "<!-- loop-agent-grilling:complete -->";
 export const PARALLEL_TASKS_START = "<!-- loop-agent-parallel-tasks:start -->";
 export const PARALLEL_TASKS_END = "<!-- loop-agent-parallel-tasks:end -->";
 export const IMPLEMENTATION_SUMMARY_START =
@@ -202,8 +203,12 @@ export function buildPlanningPipelinePrompt(
     ? [
         "<loop-agent-pipeline>",
         "작업 복잡도는 L1(국소 기능)이다. 직접 연관된 코드·호출자·테스트만 확인하고 짧은 계획을 작성하라.",
+        "L1에서도 grilling을 생략하지 말라. 먼저 grilling 스킬에 따라 한 번에 하나씩 결정·범위·완료 조건을 확인한 뒤 계획을 작성하라.",
+        "질문할 결정이 없더라도 요구사항·범위·완료 조건을 grilling 관점에서 최소 한 번 검증하라.",
+        `최종 계획을 출력할 때만 ${GRILLING_COMPLETE_MARKER}를 정확히 한 번 포함하라. 이 marker는 최소 한 번의 grilling 질문과 사용자 답변 뒤에만 출력할 수 있다.`,
+        `- ${dependencies.skillPath("grilling")}`,
         `- ${dependencies.skillPath("grill-checklist")}`,
-        "PRD, 도메인 모델링, 이슈 분해, 의미 검색은 이 작업에 사용하지 않는다.",
+        "PRD, 이슈 분해, 의미 검색은 이 작업에 사용하지 않는다. L1의 예외는 전체 문서·이슈 파이프라인에만 적용되며 grilling은 유지한다.",
         "계획 단계에서는 코드를 수정하지 말고, 구현 범위·검증 명령·완료 조건만 정리하라.",
         "한 번에 하나의 질문만 하며, 결과를 크게 바꾸는 미해결 사항이 있을 때만 질문하라.",
         "</loop-agent-pipeline>",
@@ -218,6 +223,7 @@ export function buildPlanningPipelinePrompt(
         `- ${dependencies.skillPath("to-prd")}`,
         `- ${dependencies.skillPath("to-issues")}`,
         dependencies.buildArchitectureReadGuidance(root),
+        `최종 계획을 출력할 때만 ${GRILLING_COMPLETE_MARKER}를 정확히 한 번 포함하라. grilling 질문과 사용자 답변 없이 체크리스트를 먼저 출력하면 확장이 실행을 거부한다.`,
         "필요할 때는 `read` 도구로 설치 스킬만 읽어라. 이슈·문서·변경 이력은 위 SQLite CLI와 검색 결과를 기준으로 참고하라.",
         `grill-checklist의 최종 목표 체크리스트에는 반드시 다음 아키텍처 준수 검증 항목을 포함하라: ${ARCHITECTURE_CHECKLIST_ITEM}`,
         "한 번에 하나의 질문만 하고, 아직 물을 질문이 남았으면 그 턴은 질문으로 끝내라.",
@@ -243,6 +249,7 @@ export function buildPlanningPipelinePrompt(
     `워크플로 ID는 ${workflowId}다. 최종 체크리스트 바로 앞에 ${WORKFLOW_MARKER_PREFIX}${workflowId} --> 주석을 정확히 출력하라.`,
     `최종 계획에는 ${IMPLEMENTATION_SUMMARY_START}와 ${IMPLEMENTATION_SUMMARY_END} 사이에 코드 에이전트가 바로 사용할 구현 요약을 최대 6개 bullet, 2400자 이내로 작성하라. 변경 대상·핵심 동작·검증 명령·주의할 책임 경계만 적고, 위 문서·이슈 본문을 복사하지 말라.`,
     "최종 목표 체크리스트는 반드시 아래 형식을 그대로 사용하라. 두 HTML 주석 경계는 선택 사항이 아니며, 이름·콜론·하이픈을 바꾸거나 생략하지 말라. 체크리스트 내용을 채운 뒤에도 두 경계를 최종 응답에 남겨라.",
+    "체크리스트에는 프로젝트 전체 `npm test`의 실행 또는 통과 여부 자체를 별도 항목으로 넣지 말라. 필요한 테스트 실행은 구현 계획·검증 절차에만 적고, 체크리스트에는 작업 결과를 검증하는 조건만 남겨라.",
     "<!-- grill-checklist:start -->",
     "## 목표 결과 체크리스트",
     "- [ ] 검증 가능한 결과와 통과 조건",
@@ -477,9 +484,15 @@ export async function preparePlanningPipeline(
   // plan을 요청한 L0는 최소 계획 경로로 승격해 안전하게 처리한다.
   const complexity: GoalComplexity =
     requestedComplexity === "L0" ? "L1" : requestedComplexity;
+  // L0 direct 경로와 L1 focused 경로는 독립 검수를 생략한다.
+  // L2/L3만 호출자가 지정한 autoReview 설정을 따른다.
+  const reviewEnabled =
+    requestedComplexity === "L0" || complexity === "L1"
+      ? false
+      : autoReview;
   const pipelineSkillNames =
     complexity === "L1"
-      ? ["grill-checklist"]
+      ? ["grilling", "grill-checklist"]
       : [
           "grill-with-docs",
           "to-prd",
@@ -501,8 +514,8 @@ export async function preparePlanningPipeline(
   }
 
   const workflowId = dependencies.reserveWorkflow(
-    autoReview,
-    "idle",
+    reviewEnabled,
+    "grilling",
     null,
   );
   const semanticContext =

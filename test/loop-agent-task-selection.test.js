@@ -6,6 +6,7 @@ test("parallel candidates come from SQLite-shaped records and honor ready/blocke
   const records = [
     { issue_id: "T-201", title: "A", triage_label: "ready-for-agent", status: "backlog", parent: "T-200", blockedBy: [], body: "A" },
     { issue_id: "T-202", title: "B", triage_label: "ready-for-agent", status: "current", parent: "T-200", blockedBy: [], body: "B" },
+    { issue_id: "T-206", title: "C", triage_label: "ready-for-agent", status: "backlog", parent: "T-200", blockedBy: [], body: "C" },
     { issue_id: "T-203", title: "Done", triage_label: "ready-for-agent", status: "done", parent: "T-200", blockedBy: [], body: "Done" },
     { issue_id: "T-204", title: "Blocked", triage_label: "ready-for-agent", status: "backlog", parent: "T-200", blockedBy: ["T-199"], body: "Blocked" },
     { issue_id: "T-205", title: "Other parent", triage_label: "ready-for-agent", status: "backlog", parent: "T-999", blockedBy: [], body: "Other" },
@@ -14,6 +15,7 @@ test("parallel candidates come from SQLite-shaped records and honor ready/blocke
     "<!-- loop-agent-parallel-tasks:start -->",
     "T-201",
     "T-202",
+    "T-206",
     "T-203",
     "T-204",
     "T-205",

@@ -31,7 +31,7 @@ export type PiProcessRuntime = {
   runPiCommandWithProgress(
     pi: Pick<ExtensionAPI, "sendMessage">,
     cwd: string,
-    ui: Pick<ExtensionContext["ui"], "setStatus">,
+    ui: ProgressUi,
     label: string,
     args: string[],
     timeoutMs?: number,
@@ -39,6 +39,9 @@ export type PiProcessRuntime = {
   ): Promise<StreamingRunResult>;
   killActiveChildren(): number;
 };
+
+type ProgressUi = Pick<ExtensionContext["ui"], "setStatus"> &
+  Partial<Pick<ExtensionContext["ui"], "setWidget">>;
 
 function shortenStatusLine(text: string, maxLength = 120): string {
   const collapsed = text.replace(/\s+/g, " ").trim();
@@ -221,16 +224,19 @@ function formatProgressMessage(
   stream: "stdout" | "stderr" | "heartbeat",
   transcript: string[],
   details?: string,
-): string {
+  latestStatus?: string,
+): string[] {
   const lines = [
-    `## ${label} 진행 로그`,
-    "",
-    `- 최신 상태: ${stream}`,
-    `- 누적 로그: ${transcript.length}줄`,
+    `◈ ${label} 진행 로그`,
+    `상태: ${latestStatus || stream} · 누적 ${transcript.length}줄`,
   ];
-  if (details) lines.push(`- 상세: ${details}`);
-  lines.push("", transcript.slice(-8).join("\n") || "(아직 출력 없음)");
-  return lines.join("\n");
+  if (details) lines.push(`상세: ${details}`);
+  lines.push(
+    ...(transcript.length > 0
+      ? transcript.slice(-8).map((line) => `  ${line}`)
+      : ["  (아직 출력 없음)"]),
+  );
+  return lines;
 }
 
 function withJsonMode(args: string[]): string[] {
@@ -272,30 +278,65 @@ export function createPiProcessRuntime({
   registerExitHandler?: boolean;
 } = {}): PiProcessRuntime {
   const activeChildren = new Set<ChildProcess>();
-  const activeChildStatuses = new Map<string, string>();
+  const activeChildStatuses = new Map<string, { label: string; status: string }>();
+  const activeProgresses = new Map<
+    string,
+    { ui: ProgressUi; lines: string[] }
+  >();
+  let nextProgressId = 0;
 
   const renderActiveChildStatuses = (): string | undefined => {
     if (activeChildStatuses.size === 0) return undefined;
     return Array.from(activeChildStatuses.entries())
-      .map(([label, status]) => `${label}: ${status}`)
+      .map(([, entry]) => `${entry.label}: ${entry.status}`)
       .join(" | ");
   };
 
   const setChildStatus = (
-    ui: Pick<ExtensionContext["ui"], "setStatus">,
+    ui: ProgressUi,
+    progressId: string,
     label: string,
     status: string,
   ): void => {
-    activeChildStatuses.set(label, status);
+    activeChildStatuses.set(progressId, { label, status });
     ui.setStatus("loop-agent", renderActiveChildStatuses());
   };
 
   const clearChildStatus = (
-    ui: Pick<ExtensionContext["ui"], "setStatus">,
-    label: string,
+    ui: ProgressUi,
+    progressId: string,
   ): void => {
-    activeChildStatuses.delete(label);
+    activeChildStatuses.delete(progressId);
     ui.setStatus("loop-agent", renderActiveChildStatuses());
+  };
+
+  const renderProgressWidget = (
+    ui: ProgressUi,
+  ): void => {
+    if (typeof ui.setWidget !== "function") return;
+    const lines = Array.from(activeProgresses.values())
+      .filter((entry) => entry.ui === ui)
+      .flatMap((entry, index) => (index === 0 ? entry.lines : ["", ...entry.lines]));
+    ui.setWidget("loop-agent-progress", lines.length > 0 ? lines : undefined, {
+      placement: "aboveEditor",
+    });
+  };
+
+  const setProgressWidget = (
+    ui: ProgressUi,
+    progressId: string,
+    lines: string[],
+  ): void => {
+    activeProgresses.set(progressId, { ui, lines });
+    renderProgressWidget(ui);
+  };
+
+  const clearProgressWidget = (
+    ui: ProgressUi,
+    progressId: string,
+  ): void => {
+    activeProgresses.delete(progressId);
+    renderProgressWidget(ui);
   };
 
   const killActiveChildren = (): number => {
@@ -307,6 +348,11 @@ export function createPiProcessRuntime({
     }
     activeChildren.clear();
     activeChildStatuses.clear();
+    const activeUis = new Set(
+      Array.from(activeProgresses.values(), (entry) => entry.ui),
+    );
+    activeProgresses.clear();
+    for (const ui of activeUis) renderProgressWidget(ui);
     return killed;
   };
 
@@ -317,15 +363,21 @@ export function createPiProcessRuntime({
   }
 
   const runPiCommandWithProgress = async (
-    pi: Pick<ExtensionAPI, "sendMessage">,
+    _pi: Pick<ExtensionAPI, "sendMessage">,
     cwd: string,
-    ui: Pick<ExtensionContext["ui"], "setStatus">,
+    ui: ProgressUi,
     label: string,
     args: string[],
     timeoutMs?: number,
-    isIdle?: () => boolean,
+    _isIdle?: () => boolean,
   ): Promise<StreamingRunResult> => {
-    setChildStatus(ui, label, "시작");
+    const progressId = `${label}#${++nextProgressId}`;
+    setChildStatus(ui, progressId, label, "시작");
+    setProgressWidget(
+      ui,
+      progressId,
+      formatProgressMessage(label, "heartbeat", [], "시작", "시작"),
+    );
 
     return await new Promise<StreamingRunResult>((resolve, reject) => {
       const child = spawnProcess("pi", withJsonMode(args), {
@@ -353,7 +405,11 @@ export function createPiProcessRuntime({
         errorMessage: null,
       };
 
-      const clearStatus = (): void => clearChildStatus(ui, label);
+      let latestStatus = "시작";
+      const clearStatus = (): void => {
+        clearChildStatus(ui, progressId);
+        clearProgressWidget(ui, progressId);
+      };
       const finish = (result: StreamingRunResult): void => {
         if (finished) return;
         finished = true;
@@ -378,18 +434,22 @@ export function createPiProcessRuntime({
         parsed: ParsedEventLine,
         stream: "stdout" | "stderr" = "stdout",
       ): void => {
-        if (parsed.status) setChildStatus(ui, label, parsed.status);
-        if (!parsed.log) return;
-        progressTranscript.push(parsed.log);
-        if (isIdle && !isIdle()) return;
-        pi.sendMessage(
-          {
-            customType: "loop-agent-progress",
-            content: formatProgressMessage(label, stream, progressTranscript),
-            display: true,
-            details: { label, stream, lines: progressTranscript.length },
-          },
-          { triggerTurn: false },
+        if (parsed.status) {
+          latestStatus = parsed.status;
+          setChildStatus(ui, progressId, label, parsed.status);
+        }
+        if (parsed.log) progressTranscript.push(parsed.log);
+        if (!parsed.log && !parsed.status) return;
+        setProgressWidget(
+          ui,
+          progressId,
+          formatProgressMessage(
+            label,
+            stream,
+            progressTranscript,
+            undefined,
+            latestStatus,
+          ),
         );
       };
       const ingestStdout = (chunk: string): void => {
@@ -419,21 +479,18 @@ export function createPiProcessRuntime({
       };
 
       heartbeat = setInterval(() => {
-        if (finished || (isIdle && !isIdle())) return;
+        if (finished) return;
         const elapsedSeconds = Math.max(1, Math.floor((Date.now() - lastActivity) / 1000));
-        pi.sendMessage(
-          {
-            customType: "loop-agent-progress",
-            content: formatProgressMessage(
-              label,
-              "heartbeat",
-              progressTranscript,
-              `${elapsedSeconds}초 동안 새 출력 없음`,
-            ),
-            display: true,
-            details: { label, stream: "heartbeat", lines: progressTranscript.length, elapsedSeconds },
-          },
-          { triggerTurn: false },
+        setProgressWidget(
+          ui,
+          progressId,
+          formatProgressMessage(
+            label,
+            "heartbeat",
+            progressTranscript,
+            `${elapsedSeconds}초 동안 새 출력 없음`,
+            latestStatus,
+          ),
         );
       }, 5000);
 
@@ -442,7 +499,13 @@ export function createPiProcessRuntime({
           timedOut = true;
           signalChild(child, "SIGTERM");
           killTimer = scheduleHardKill(child);
-          setChildStatus(ui, label, "시간 초과, 종료 중");
+          latestStatus = "시간 초과, 종료 중";
+          setChildStatus(ui, progressId, label, latestStatus);
+          setProgressWidget(
+            ui,
+            progressId,
+            formatProgressMessage(label, "heartbeat", progressTranscript, undefined, latestStatus),
+          );
         }, timeoutMs);
       }
       child.stdout?.on("data", (chunk: Buffer) => ingestStdout(chunk.toString("utf8")));

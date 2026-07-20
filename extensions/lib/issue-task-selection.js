@@ -2,7 +2,7 @@
 
 const PARALLEL_TASKS_START = "<!-- loop-agent-parallel-tasks:start -->";
 const PARALLEL_TASKS_END = "<!-- loop-agent-parallel-tasks:end -->";
-const DEFAULT_MAX_TASKS = 4;
+const DEFAULT_MAX_TASKS = 2;
 
 function extractParallelTaskIds(text) {
   const start = text.indexOf(PARALLEL_TASKS_START);
