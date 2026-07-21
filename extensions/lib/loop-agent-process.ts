@@ -265,7 +265,7 @@ function signalChild(child: ChildProcess, signal: NodeJS.Signals): void {
 }
 
 function scheduleHardKill(child: ChildProcess): ReturnType<typeof setTimeout> {
-  const timer = setTimeout(() => signalChild(child, "SIGKILL"), 5000);
+  const timer = setTimeout(() => signalChild(child, "SIGKILL"), 10000);
   timer.unref();
   return timer;
 }
@@ -486,13 +486,13 @@ export function createPiProcessRuntime({
           progressId,
           formatProgressMessage(
             label,
-            "heartbeat",
+            "idle",
             progressTranscript,
             `${elapsedSeconds}초 동안 새 출력 없음`,
             latestStatus,
           ),
         );
-      }, 5000);
+      }, 30000);
 
       if (timeoutMs !== undefined) {
         timer = setTimeout(() => {

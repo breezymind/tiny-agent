@@ -169,6 +169,12 @@ export function buildDirectCodingPrompt(
       ? formatSemanticSearchContext(semanticContext)
       : "";
   const prompt = [
+    "## 📝 사용자 요청",
+    "",
+    objective,
+    "",
+    "---",
+    "",
     `<loop-agent-context tier="${complexity}">`,
     "작은 단일 작업이다. 인터뷰, PRD, 이슈 분해 없이 바로 구현하라.",
     "최소 변경으로 요청을 충족하고, 끝나면 변경 내용과 검증 근거를 간단히 보고하라.",
@@ -179,8 +185,6 @@ export function buildDirectCodingPrompt(
     implementationGuidance,
     ...(taskTracking ? ["", taskTracking] : []),
     ...(searchContext ? ["", searchContext] : []),
-    "작업 요청:",
-    objective,
     "</loop-agent-context>",
   ].join("\n");
 
@@ -236,11 +240,18 @@ export function buildPlanningPipelinePrompt(
     semanticContext.architectureResults.length === 0
       ? ""
       : formatSemanticSearchContext(semanticContext);
-  return [
-    ...pipelineGuidance,
-    ...(searchContext ? ["", searchContext] : []),
+  const userRequestHeader = [
+    "## 📝 사용자 요청",
     "",
     objective,
+    "",
+    "---",
+    "",
+  ].join("\n");
+  return [
+    userRequestHeader,
+    ...pipelineGuidance,
+    ...(searchContext ? ["", searchContext] : []),
     "",
     "<loop-agent-auto>",
     isFocused

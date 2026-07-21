@@ -75,10 +75,15 @@ function spawnDetachedIndexer(
     const child = spawn(command, args, {
       cwd: projectRoot,
       detached: true,
-      stdio: "ignore",
+      stdio: ["ignore", "ignore", "pipe"],
+      env: { ...process.env },
     });
     child.once("error", lock.release);
     child.once("exit", lock.release);
+    // 자식의 stderr를 부모 stderr로 중계해 디버깅 가능하게 한다.
+    child.stderr?.on("data", (chunk: Buffer) => {
+      process.stderr.write(`[auto-index:${label}] ${chunk.toString()}`);
+    });
     child.unref();
     ctx.ui.notify(`${label} 인덱싱 시작: ${projectRoot}`, "info");
   } catch (error) {
@@ -144,6 +149,10 @@ export default function autoIndexExtension(pi: ExtensionAPI) {
   // startup, reload, new, resume, fork 모두 이 이벤트를 거치지만 각 인덱서의
   // 상태 확인과 lock 덕분에 동일 프로젝트가 중복 인덱싱되지는 않는다.
   pi.on("session_start", async (_event, ctx) => {
+    // loop-agent가 띄운 코드 자식은 이미 부모 세션의 작업 흐름에 속한다.
+    // 임시 worktree마다 CodeGraph 인덱싱을 다시 시작하면 fan-out 시점의
+    // 디스크·CPU 부하가 커지고, 자식마다 중복 인덱서가 생길 수 있다.
+    if (process.env.LOOP_AGENT_CHILD === "1") return;
     await autoIndex(pi, ctx);
   });
 }

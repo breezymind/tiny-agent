@@ -140,20 +140,27 @@ async function withLog(logPath, callback) {
 }
 
 test("same project sessions start at most one auto-index process", async () => {
-  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "auto-index-project-"));
-  const logPath = path.join(projectRoot, "index.log");
-  const harness = createHarness(projectRoot);
-  await harness.install();
+  const previousChildFlag = process.env.LOOP_AGENT_CHILD;
+  delete process.env.LOOP_AGENT_CHILD;
+  try {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "auto-index-project-"));
+    const logPath = path.join(projectRoot, "index.log");
+    const harness = createHarness(projectRoot);
+    await harness.install();
 
-  await withLog(logPath, async () => {
-    await Promise.all([harness.start(), harness.start()]);
-    await waitFor(() => readInitCount(logPath) === 1, "the first index process did not start");
-    assert.equal(readInitCount(logPath), 1);
-    await waitFor(
-      () => !fs.existsSync(lockPathFor(projectRoot)),
-      "the auto-index lock was not released after the process exited",
-    );
-  });
+    await withLog(logPath, async () => {
+      await Promise.all([harness.start(), harness.start()]);
+      await waitFor(() => readInitCount(logPath) === 1, "the first index process did not start");
+      assert.equal(readInitCount(logPath), 1);
+      await waitFor(
+        () => !fs.existsSync(lockPathFor(projectRoot)),
+        "the auto-index lock was not released after the process exited",
+      );
+    });
+  } finally {
+    if (previousChildFlag === undefined) delete process.env.LOOP_AGENT_CHILD;
+    else process.env.LOOP_AGENT_CHILD = previousChildFlag;
+  }
 });
 
 test("a fresh lock remains authoritative and blocks a duplicate index", async () => {
@@ -175,24 +182,48 @@ test("a fresh lock remains authoritative and blocks a duplicate index", async ()
 });
 
 test("a lock older than the stale threshold is reclaimed for indexing", async () => {
-  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "auto-index-stale-"));
-  const logPath = path.join(projectRoot, "index.log");
-  const lockPath = lockPathFor(projectRoot);
-  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-  fs.writeFileSync(lockPath, "stale");
-  const staleTime = new Date(Date.now() - LOCK_STALE_MS - 1000);
-  fs.utimesSync(lockPath, staleTime, staleTime);
+  const previousChildFlag = process.env.LOOP_AGENT_CHILD;
+  delete process.env.LOOP_AGENT_CHILD;
+  try {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "auto-index-stale-"));
+    const logPath = path.join(projectRoot, "index.log");
+    const lockPath = lockPathFor(projectRoot);
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, "stale");
+    const staleTime = new Date(Date.now() - LOCK_STALE_MS - 1000);
+    fs.utimesSync(lockPath, staleTime, staleTime);
 
+    const harness = createHarness(projectRoot);
+    await harness.install();
+    await withLog(logPath, async () => {
+      await harness.start();
+      await waitFor(() => readInitCount(logPath) === 1, "the stale lock was not reclaimed");
+      assert.equal(readInitCount(logPath), 1);
+      assert.equal(fs.readFileSync(lockPath, "utf8"), "");
+      await waitFor(
+        () => !fs.existsSync(lockPath),
+        "the reclaimed auto-index lock was not released after the process exited",
+      );
+    });
+  } finally {
+    if (previousChildFlag === undefined) delete process.env.LOOP_AGENT_CHILD;
+    else process.env.LOOP_AGENT_CHILD = previousChildFlag;
+  }
+});
+
+test("coding child sessions skip automatic indexing", async () => {
+  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "auto-index-child-"));
   const harness = createHarness(projectRoot);
   await harness.install();
-  await withLog(logPath, async () => {
+
+  const previousChildFlag = process.env.LOOP_AGENT_CHILD;
+  process.env.LOOP_AGENT_CHILD = "1";
+  try {
     await harness.start();
-    await waitFor(() => readInitCount(logPath) === 1, "the stale lock was not reclaimed");
-    assert.equal(readInitCount(logPath), 1);
-    assert.equal(fs.readFileSync(lockPath, "utf8"), "");
-    await waitFor(
-      () => !fs.existsSync(lockPath),
-      "the reclaimed auto-index lock was not released after the process exited",
-    );
-  });
+    assert.equal(harness.execCalls.length, 0);
+    assert.equal(harness.notifications.length, 0);
+  } finally {
+    if (previousChildFlag === undefined) delete process.env.LOOP_AGENT_CHILD;
+    else process.env.LOOP_AGENT_CHILD = previousChildFlag;
+  }
 });

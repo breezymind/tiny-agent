@@ -64,6 +64,27 @@ export function loadWorkflowConfig(configPath: string): WorkflowConfig {
   }
 }
 
+/**
+ * easy-goal 모드(PI_LOOP_AGENT_EASY_THINKING 환경변수 또는 기본 "medium")일 때
+ * thinking level을 제한한다. null을 반환하면 --thinking 플래그를 생략한다.
+ */
+export function resolveEasyThinkingLevel(
+  configuredLevel: ThinkingLevel | null,
+  isEasyMode: boolean,
+): ThinkingLevel | null {
+  if (!isEasyMode) return configuredLevel;
+  const easyEnv = process.env.PI_LOOP_AGENT_EASY_THINKING?.trim();
+  if (easyEnv && isThinkingLevel(easyEnv)) return easyEnv;
+  // 기본 easy 모드 상한: medium을 넘지 않음
+  if (
+    configuredLevel &&
+    THINKING_LEVELS.indexOf(configuredLevel) <= THINKING_LEVELS.indexOf("medium")
+  ) {
+    return configuredLevel;
+  }
+  return "medium";
+}
+
 export function saveWorkflowConfig(
   configPath: string,
   workflowConfig: WorkflowConfig,

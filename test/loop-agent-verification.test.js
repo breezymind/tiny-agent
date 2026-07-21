@@ -105,32 +105,34 @@ function createTestAgentRuntime(root, { status, exitCode, stdout = "", stderr = 
     runPiCommandWithProgress: async (_pi, _cwd, _ui, _label, args) => {
       const prompt = args.at(-1);
       assert.match(prompt, /실제 테스트를 실행하는 테스트 서브에이전트/);
+      // resolveVerificationCommands가 npm을 우회해 실제 테스트 러너를
+      // 직접 추출하므로, mock도 동일한 명령을 반환해야 parseTestAgentVerification
+      // 검증을 통과한다.
+      const specsMatch = prompt.match(/실행할 검증 명령 목록\(JSON\):\n(\[[\s\S]*?\])\n\n<!-- loop-agent-test-verification:start -->/);
+      const specs = JSON.parse(specsMatch[1]);
+      const results = specs.map((spec) => ({
+        program: spec.program,
+        args: spec.args,
+        cwd: spec.cwd,
+        timeoutMs: spec.timeoutMs,
+        required: spec.required,
+        status,
+        spawned: true,
+        exitCode,
+        signal: null,
+        timeout: false,
+        stdout,
+        stderr,
+        startedAt: new Date().toISOString(),
+        endedAt: new Date().toISOString(),
+        durationMs: 2,
+      }));
       return {
         code: 0,
         finalText: [
           "테스트 서브에이전트 실행 보고",
           "<!-- loop-agent-test-verification:start -->",
-          JSON.stringify({
-            results: [
-              {
-                program: "npm",
-                args: ["test"],
-                cwd: root,
-                timeoutMs: 15 * 60 * 1000,
-                required: true,
-                status,
-                spawned: true,
-                exitCode,
-                signal: null,
-                timeout: false,
-                stdout,
-                stderr,
-                startedAt: new Date().toISOString(),
-                endedAt: new Date().toISOString(),
-                durationMs: 2,
-              },
-            ],
-          }),
+          JSON.stringify({ results }),
           "<!-- loop-agent-test-verification:end -->",
         ].join("\n"),
         stderr: "",
@@ -184,7 +186,7 @@ test("loop-agent PASS follows the test subagent's structured exit result", async
   assert.equal(result.verification.requiredExecutedCount, 1);
   assert.equal(result.result.overall, "PASS");
   assert.match(result.report, /테스트 서브에이전트 실행 보고/);
-  assert.match(result.report, /npm test: PASS/);
+  assert.match(result.report, /: PASS/);
 });
 
 test("loop-agent cannot report PASS when the test subagent reports a non-zero exit", async () => {

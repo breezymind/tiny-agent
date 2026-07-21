@@ -86,6 +86,7 @@ import {
 import {
   isThinkingLevel,
   loadWorkflowConfig,
+  resolveEasyThinkingLevel,
   saveWorkflowConfig,
   THINKING_LEVELS,
 } from "./lib/loop-agent-config.ts";
@@ -95,6 +96,9 @@ import {
 } from "./lib/loop-agent-persona.ts";
 import {
   createParallelWorkspace,
+  copyWorktreeRuntimeFiles,
+  listGitWorktreeChanges,
+  readGitStatus,
   type ParallelWorkspace,
 } from "./lib/loop-agent-workspace.ts";
 import {
@@ -546,22 +550,6 @@ function shouldSkipSnapshotPath(relativePath: string): boolean {
   );
 }
 
-function copyWorktreeRuntimeFiles(
-  sourceRoot: string,
-  worktreeRoot: string,
-): void {
-  // Git worktrees intentionally omit ignored files. Preserve the same
-  // non-secret runtime files that the snapshot path would have carried over,
-  // such as docs/issues.sqlite, without copying tracked source files again.
-  for (const relativePath of listWorkspaceFiles(sourceRoot)) {
-    const sourcePath = path.join(sourceRoot, relativePath);
-    const destinationPath = path.join(worktreeRoot, relativePath);
-    if (fs.existsSync(destinationPath)) continue;
-    fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
-    fs.copyFileSync(sourcePath, destinationPath);
-  }
-}
-
 async function copyWorkspaceSnapshot(
   sourceRoot: string,
   snapshotRoot: string,
@@ -646,9 +634,20 @@ function detectSnapshotChanges(
 function applySnapshotChanges(
   sourceRoot: string,
   taskRuns: ParallelTaskRun[],
-  baseHashes: Map<string, string>,
+  baseHashes: Map<string, string> | null,
+  baseGitStatus: string | null,
 ): { ok: true } | { ok: false; reason: string } {
   const claimedPaths = new Map<string, string>();
+
+  if (baseHashes === null) {
+    const currentGitStatus = readGitStatus(sourceRoot);
+    if (baseGitStatus === null || currentGitStatus !== baseGitStatus) {
+      return {
+        ok: false,
+        reason: "병렬 실행 중 원본 Git worktree가 바뀌어 자동 병합을 중단합니다.",
+      };
+    }
+  }
 
   for (const run of taskRuns) {
     for (const change of run.changes) {
@@ -663,18 +662,20 @@ function applySnapshotChanges(
     }
   }
 
-  for (const run of taskRuns) {
-    for (const change of run.changes) {
-      const destinationPath = path.join(sourceRoot, change.relativePath);
-      const currentHash = fs.existsSync(destinationPath)
-        ? hashFile(destinationPath)
-        : null;
-      const expectedHash = baseHashes.get(change.relativePath) ?? null;
-      if (currentHash !== expectedHash) {
-        return {
-          ok: false,
-          reason: `병합 직전 원본 파일이 바뀌어 자동 병합을 중단합니다: ${change.relativePath}`,
-        };
+  if (baseHashes !== null) {
+    for (const run of taskRuns) {
+      for (const change of run.changes) {
+        const destinationPath = path.join(sourceRoot, change.relativePath);
+        const currentHash = fs.existsSync(destinationPath)
+          ? hashFile(destinationPath)
+          : null;
+        const expectedHash = baseHashes.get(change.relativePath) ?? null;
+        if (currentHash !== expectedHash) {
+          return {
+            ok: false,
+            reason: `병합 직전 원본 파일이 바뀌어 자동 병합을 중단합니다: ${change.relativePath}`,
+          };
+        }
       }
     }
   }
@@ -1742,6 +1743,77 @@ function verificationCommandLabel(spec: VerificationCommandSpec): string {
  * 테스트 서브에이전트에 넘길 표준 검증 명령을 결정한다.
  * 필요하면 PI_VERIFICATION_COMMANDS로 program/args 배열을 명시적으로 주입할 수 있다.
  */
+/**
+ * package.json의 test 스크립트에서 npm 라이프사이클(pre/post 훅)을
+ * 우회해 실제 테스트 러너만 추출한다. npm test 대신 직접 실행하면
+ * pretest/posttest에 포함된 빌드·트랜스파일 단계가 실행되지 않는다.
+ */
+function resolveTestCommand(
+  testScript: string,
+  root: string,
+  nodeBinDir: string,
+): Pick<VerificationCommandSpec, "program" | "args"> {
+  const trimmed = testScript.trim();
+
+  // "node <args>" 패턴 — npm 훅을 완전히 우회한다.
+  const nodeMatch = trimmed.match(/^node\s+(.*)$/);
+  if (nodeMatch) {
+    const rawArgs = nodeMatch[1].trim();
+    return { program: process.execPath, args: rawArgs.split(/\s+/) };
+  }
+
+  // "npx <runner>" 또는 "npx -y <runner>" — npx는 자체 실행이므로 안전하다.
+  const npxMatch = trimmed.match(/^npx\s+(?:-y\s+)?(.*)$/);
+  if (npxMatch) {
+    const rawArgs = npxMatch[1].trim();
+    return { program: "npx", args: ["-y", ...rawArgs.split(/\s+/)] };
+  }
+
+  // "tsx" / "tsx --import" / "tsx <args>" 패턴
+  const tsxMatch = trimmed.match(/^tsx\s+(.*)$/);
+  if (tsxMatch) {
+    const tsxBin = path.join(nodeBinDir, "tsx");
+    if (fs.existsSync(tsxBin)) {
+      return { program: process.execPath, args: ["--import=tsx", ...tsxMatch[1].trim().split(/\s+/)] };
+    }
+  }
+
+  // "jest" / "vitest" / "mocha" / "ava" 같은 노드 테스트 러너
+  const knownRunners = ["jest", "vitest", "mocha", "ava", "tap", "uvu"];
+  for (const runner of knownRunners) {
+    const runnerMatch = trimmed.match(new RegExp(`^${runner}\\s+(.*)$`));
+    if (runnerMatch) {
+      const runnerBin = path.join(nodeBinDir, runner);
+      const program = fs.existsSync(runnerBin) ? runnerBin : runner;
+      const runnerArgs = runnerMatch[1].trim();
+      return {
+        program,
+        args: runnerArgs ? runnerArgs.split(/\s+/) : [],
+      };
+    }
+  }
+
+  // 인자 없는 러너 (예: "jest", "vitest"만 단독)
+  for (const runner of knownRunners) {
+    if (trimmed === runner) {
+      const runnerBin = path.join(nodeBinDir, runner);
+      return { program: fs.existsSync(runnerBin) ? runnerBin : runner, args: [] };
+    }
+  }
+
+  // "tsx" 단독 (run without args — probably a mistake but handle it)
+  if (trimmed === "tsx") {
+    const tsxBin = path.join(nodeBinDir, "tsx");
+    if (fs.existsSync(tsxBin)) {
+      return { program: process.execPath, args: ["--import=tsx"] };
+    }
+  }
+
+  // Fallback: npm 라이프사이클을 통과하지만, 테스트 에이전트 프롬프트의
+  // no-build 지침과 CI 환경변수가 pretest 빌드를 최대한 억제한다.
+  return { program: "npm", args: ["test"] };
+}
+
 function resolveVerificationCommands(root: string): VerificationCommandSpec[] {
   const configured = process.env.PI_VERIFICATION_COMMANDS;
   if (configured) {
@@ -1778,10 +1850,12 @@ function resolveVerificationCommands(root: string): VerificationCommandSpec[] {
         scripts?: Record<string, unknown>;
       };
       if (typeof packageJson.scripts?.test === "string") {
+        const testScript = packageJson.scripts.test.trim();
+        const nodeBinDir = path.join(root, "node_modules", ".bin");
+        const resolved = resolveTestCommand(testScript, root, nodeBinDir);
         return [
           {
-            program: "npm",
-            args: ["test"],
+            ...resolved,
             cwd: root,
             timeoutMs: TEST_TIMEOUT_MS,
             required: true,
@@ -2063,6 +2137,7 @@ async function runValidatedTestAgent(
   checklist: string,
   workflowConfig: WorkflowConfig = config,
   process: PiProcessRuntime = processRuntime,
+  isEasyMode = false,
 ): Promise<{
   report: string;
   result: TestResult;
@@ -2070,8 +2145,12 @@ async function runValidatedTestAgent(
 }> {
   const verificationSpecs = resolveVerificationCommands(ctx.cwd);
   const testModel = workflowConfig.testModel ?? workflowConfig.codingModel;
-  const testThinkingLevel =
+  const configuredThinking =
     workflowConfig.testThinkingLevel ?? workflowConfig.codingThinkingLevel;
+  const testThinkingLevel = resolveEasyThinkingLevel(
+    configuredThinking,
+    isEasyMode,
+  );
 
   if (
     !testModel ||
@@ -2093,6 +2172,7 @@ async function runValidatedTestAgent(
       "당신은 실제 테스트를 실행하는 테스트 서브에이전트다.",
       "아래 검증 명령을 현재 작업 디렉터리에서 직접 실행하라. 명령마다 bash 도구를 사용하고, program과 args를 임의로 바꾸거나 생략하지 말라.",
       "각 검증 명령은 한 번만 실행하라. 코드나 파일은 수정하지 말라.",
+      "절대로 빌드·컴파일·트랜스파일 명령(npm run build, cargo build, make, cmake, tsc, esbuild, webpack, vite build 등)을 실행하지 말라. 검증 명령 목록에 있는 프로그램과 인자만 그대로 실행하라.",
       "명령 실행 결과의 종료 코드와 stdout/stderr를 근거로 PASS, FAIL, UNVERIFIED를 판정하라.",
       "마지막에는 반드시 지정된 구조화 결과 블록을 출력하라. 블록 안에는 설명이나 Markdown 펜스를 넣지 말라.",
       "보고서는 한국어로 작성하라.",
@@ -2178,6 +2258,7 @@ async function runParallelCodingPhase(
   planningResponse: string,
   process: PiProcessRuntime = processRuntime,
   workflowConfig: WorkflowConfig = config,
+  isEasyMode = false,
 ): Promise<string | null> {
   const tasks = chooseParallelCodingTasks(ctx.cwd, planningResponse, (line) => {
     ctx.ui.notify(`loop-agent: ${line}`, "info");
@@ -2189,7 +2270,8 @@ async function runParallelCodingPhase(
     "info",
   );
 
-  const baseHashes = captureWorkspaceHashes(ctx.cwd);
+  const baseGitStatus = readGitStatus(ctx.cwd);
+  let baseHashes: Map<string, string> | null = null;
   const workspaces: ParallelWorkspace[] = [];
   try {
     const settledRuns = await runWithConcurrency(
@@ -2204,6 +2286,11 @@ async function runParallelCodingPhase(
         );
         workspaces.push(workspace);
         if (workspace.kind === "snapshot") {
+          // 전체 workspace 해시는 dirty/non-Git snapshot fallback에서만
+          // 필요하다. clean Git worktree는 아래의 Git 변경 목록을 사용한다.
+          if (baseHashes === null) {
+            baseHashes = captureWorkspaceHashes(ctx.cwd);
+          }
           ctx.ui.notify(
             `loop-agent: ${task.id}는 ${workspace.fallbackReason ?? "snapshot"} 상태로 인해 기존 snapshot 방식으로 실행합니다.`,
             "info",
@@ -2217,8 +2304,15 @@ async function runParallelCodingPhase(
           prompt,
           process,
           workflowConfig,
+          isEasyMode,
         );
-        const changes = detectSnapshotChanges(workspace.root, baseHashes);
+        const changes =
+          workspace.kind === "worktree"
+            ? listGitWorktreeChanges(workspace.root)
+            : detectSnapshotChanges(
+                workspace.root,
+                baseHashes ?? captureWorkspaceHashes(ctx.cwd),
+              );
         return { task, snapshotDir: workspace.root, output, changes };
       },
     );
@@ -2250,7 +2344,12 @@ async function runParallelCodingPhase(
           result.status === "fulfilled",
       )
       .map((result) => result.value);
-    const mergeResult = applySnapshotChanges(ctx.cwd, taskRuns, baseHashes);
+    const mergeResult = applySnapshotChanges(
+      ctx.cwd,
+      taskRuns,
+      baseHashes,
+      baseGitStatus,
+    );
     if (!mergeResult.ok) {
       ctx.ui.notify(
         `loop-agent: 병렬 코딩 결과를 자동 병합할 수 없어 단일 코딩 경로로 fallback 합니다 (${mergeResult.reason}).`,
@@ -2270,6 +2369,7 @@ async function runParallelCodingPhase(
       integrationPrompt,
       process,
       workflowConfig,
+      isEasyMode,
     );
     const combined = taskRuns
       .map(
@@ -2295,19 +2395,24 @@ async function runCodingPhase(
   workflowState: GateState = state,
   workflowConfig: WorkflowConfig = config,
 ): Promise<string> {
-  const parallelOutput =
-    workflowState.improvementRound === 0
-      ? await runParallelCodingPhase(
-          pi,
-          ctx,
-          checklist,
-          prompt,
-          process,
-          workflowConfig,
-        )
-      : null;
+  const parallelOutput = await runParallelCodingPhase(
+    pi,
+    ctx,
+    checklist,
+    prompt,
+    process,
+    workflowConfig,
+    !workflowState.autoReview,
+  );
   if (parallelOutput) return parallelOutput;
-  return runCodingAgent(pi, ctx, prompt, process, workflowConfig);
+  return runCodingAgent(
+    pi,
+    ctx,
+    prompt,
+    process,
+    workflowConfig,
+    !workflowState.autoReview,
+  );
 }
 
 function mergeVerificationResults(
@@ -2359,6 +2464,7 @@ async function runCodingAgent(
   prompt: string,
   process: PiProcessRuntime = processRuntime,
   workflowConfig: WorkflowConfig = config,
+  isEasyMode = false,
 ): Promise<string> {
   const args = [
     "--mode",
@@ -2372,8 +2478,11 @@ async function runCodingAgent(
     workflowConfig.codingModel ??
     (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null);
   if (modelName) args.push("--model", modelName);
-  if (workflowConfig.codingThinkingLevel)
-    args.push("--thinking", workflowConfig.codingThinkingLevel);
+  const codingThinking = resolveEasyThinkingLevel(
+    workflowConfig.codingThinkingLevel,
+    isEasyMode,
+  );
+  if (codingThinking) args.push("--thinking", codingThinking);
   args.push(withRolePersona("coding", prompt));
 
   // loop-agent만 환경 플래그로 비활성화하고 MCP 어댑터 등 나머지 확장은
@@ -2480,7 +2589,10 @@ async function recoverFromTestFailure(
     failureReport,
     {
       modelName: workflowConfig.planningModel,
-      thinkingLevel: workflowConfig.planningThinkingLevel,
+      thinkingLevel: resolveEasyThinkingLevel(
+        workflowConfig.planningThinkingLevel,
+        !workflowState.autoReview,
+      ),
       mode: "test-failure-diagnosis",
       processRuntime: execution.process,
       workflowConfig,
@@ -2602,6 +2714,7 @@ async function runTestingStage(
       checklist,
       execution.getConfig(),
       execution.process,
+      !execution.state.autoReview,
     );
     testReport = testRun.report;
     testResult = testRun.result;
@@ -3117,6 +3230,10 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       explicit,
     );
     if (!result.prompt) return result.handled;
+    ctx.ui.notify(
+      `📝 입력: ${rawObjective.length > 200 ? rawObjective.slice(0, 200) + "..." : rawObjective}`,
+      "info",
+    );
     sendQueuedUserMessage(piApi, ctx, result.prompt);
     return true;
   }
@@ -3189,6 +3306,10 @@ export default function loopAgentExtension(pi: ExtensionAPI) {
       return { action: "continue" };
     }
     if (result.prompt) {
+      ctx.ui.notify(
+        `📝 입력: ${text.length > 200 ? text.slice(0, 200) + "..." : text}`,
+        "info",
+      );
       return { action: "transform", text: result.prompt };
     }
     return { action: "handled" };

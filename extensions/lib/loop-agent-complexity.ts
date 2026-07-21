@@ -1,6 +1,6 @@
 import type { GoalComplexity } from "./loop-agent-planning.ts";
 
-export const COMPLEXITY_ROUTER_TIMEOUT_MS = 90 * 1000;
+export const COMPLEXITY_ROUTER_TIMEOUT_MS = 30 * 1000;
 
 const COMPLEXITY_LEVELS = new Set<GoalComplexity>(["L0", "L1", "L2", "L3"]);
 
